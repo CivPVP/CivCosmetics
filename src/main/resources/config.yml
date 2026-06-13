@@ -1,0 +1,104 @@
+prefix: "&b&lCIV&f&lPVP"
+store-url: "https://www.patreon.com/c/CivPVP"
+lore-editor-url: "https://civpvp.net/lore-editor"
+prefix-max-length: 16
+trim-cooldown-hours: 12
+trim-enforcement: true
+
+mysql:
+  enabled: true
+  host: "localhost"
+  port: 3306
+  dbname: "minecraft"
+  username: "minecraft"
+  password: ""
+  use-ssl: false
+  connection-timeout-ms: 5000
+  import-yaml-on-enable: true
+
+lore:
+  max-lines: 30
+  max-total-characters: 4096
+
+weapon-link:
+  enabled: true
+  fallback-local-range: 1000
+  crafted-by:
+    enabled: true
+    show-in-lore: true
+    show-in-hover: true
+    line-format: "&7Crafted by: &b{name}"
+  slayer-of:
+    enabled: true
+    show-in-lore: true
+    show-in-hover: true
+    visible-lines: 5
+    hover-limit: 50
+    line-format: "&7Slayer of &c{name}"
+    more-format: "&8and {count} more"
+  allowed-materials:
+    - WOODEN_SWORD
+    - STONE_SWORD
+    - IRON_SWORD
+    - GOLDEN_SWORD
+    - DIAMOND_SWORD
+    - NETHERITE_SWORD
+
+kill-effect-sounds:
+  enabled: true
+  volume: 0.55
+  preview-volume: 0.35
+
+trails:
+  max-ticks: 200
+  max-active-per-player: 2
+  max-active-global: 60
+  stuck-velocity-threshold: 0.03
+  stuck-ticks-before-stop: 5
+
+# Presets are meant for small supporter groups where one click should grant
+# a whole package. Use "all" when the perk should unlock an entire category.
+grant-presets:
+  supporter:
+    display: "&6&lSupporter Package"
+    icon: "GOLD_INGOT"
+    lore-credits: 3
+    grants:
+      title:
+        - "all"
+      tags:
+        - "champion"
+        - "knight"
+        - "lucky"
+        - "veteran"
+      trails:
+        - "hearts"
+        - "flame"
+        - "music"
+      killeffects:
+        - "firework"
+        - "snow"
+        - "wealth"
+      killmsg:
+        - "all"
+      lore:
+        - "item"
+  patreon:
+    display: "&d&lPatreon Full Cosmetics"
+    icon: "NETHER_STAR"
+    lore-credits: 1
+    grants:
+      title:
+        - "all"
+      tags:
+        - "all"
+      trails:
+        - "all"
+      killeffects:
+        - "all"
+      trim:
+        - "all"
+      killmsg:
+        - "all"
+      lore:
+        - "item"

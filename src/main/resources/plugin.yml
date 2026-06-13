@@ -1,0 +1,44 @@
+name: CivCosmetics
+version: ${version}
+main: net.civmc.civcosmetics.CivCosmeticsPlugin
+author: CivPvP
+description: Cosmetics, prefixes, trails, kill effects, armor trims, and item lore for Civ PvP.
+api-version: 1.21
+softdepend:
+  - CivChat2
+  - TAB
+  - Vault
+  - PlaceholderAPI
+libraries:
+  - org.mariadb.jdbc:mariadb-java-client:3.5.6
+  - com.zaxxer:HikariCP:5.0.1
+  - org.slf4j:slf4j-api:2.0.17
+commands:
+  cosmetics:
+    aliases: [ cos, shop, menu ]
+  killeffects:
+    aliases: [ killeffect ]
+  trails:
+    aliases: [ trail, projectiles ]
+  tags:
+    aliases: [ tag, prefixes, prefix, titles ]
+  settitle: {}
+  cleartitle: {}
+  setkillmsg: {}
+  clearkillmsg: {}
+  setlore: {}
+  clearlore: {}
+  link: {}
+  settrim: {}
+  cosadmin:
+    aliases: [ civcos, cosmeticadmin ]
+    permission: civ.cosmetic.admin
+  cosadmingui:
+    permission: civ.cosmetic.admin
+  titleadmin:
+    permission: civ.cosmetic.admin
+  addlorecredit:
+    permission: civ.cosmetic.admin
+permissions:
+  civ.cosmetic.admin:
+    default: op
