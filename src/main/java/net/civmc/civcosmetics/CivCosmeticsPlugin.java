@@ -1,6 +1,10 @@
 package net.civmc.civcosmetics;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,6 +53,8 @@ import org.bukkit.Sound;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.ConsoleCommandSender;
+import org.bukkit.command.RemoteConsoleCommandSender;
 import org.bukkit.command.TabCompleter;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Entity;
@@ -114,17 +120,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         10, 11, 12, 13, 14, 15, 16,
         19, 20, 21, 22, 23, 24, 25,
         28, 29, 30, 31, 32, 33, 34);
-    private static final List<Integer> TRAIL_SLOTS = List.of(
-        10, 11, 12, 13, 14, 15, 16,
-        20, 21, 22, 23, 24);
-    private static final List<Integer> TRIM_PATTERN_SLOTS = List.of(10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23, 24, 25, 28, 29, 30, 31);
-    private static final List<Integer> TRIM_MATERIAL_SLOTS = List.of(11, 12, 13, 14, 15, 20, 21, 22, 23, 24);
     private static final List<Integer> ADMIN_PLAYER_SLOTS = List.of(
         10, 11, 12, 13, 14, 15, 16,
         19, 20, 21, 22, 23, 24, 25,
         28, 29, 30, 31, 32, 33, 34,
         37, 38, 39, 40, 41, 42, 43);
-    private static final List<Integer> EFFECT_SLOTS = ADMIN_PLAYER_SLOTS;
     private static final List<Integer> ADMIN_OPTION_SLOTS = TAG_SLOTS;
     private static final List<Integer> ADMIN_CATEGORY_SLOTS = List.of(11, 13, 15, 20, 22, 24);
 
@@ -145,6 +145,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private final Map<UUID, List<Consumer<PlayerData>>> loadCallbacks = new ConcurrentHashMap<>();
     private final Map<UUID, PendingSave> failedSaves = new ConcurrentHashMap<>();
     private final AtomicBoolean failedSaveRetryInFlight = new AtomicBoolean();
+    private final AtomicBoolean entitlementPollInFlight = new AtomicBoolean();
+    /** Store deliveries that could not reach the database. Kept on disk and retried; the ledger makes retries safe. */
+    private final List<StoreOp> pendingStoreOps = new ArrayList<>();
+    private File pendingStoreOpsFile;
+    private Map<Rarity, String> rarityRanks = new EnumMap<>(Rarity.class);
     private final Map<UUID, Long> lastEffectPreview = new HashMap<>();
     private final Set<Entity> effectEntities = new HashSet<>();
     private LoreGuard loreGuard;
@@ -244,6 +249,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             loadPlayer(player);
         }
         Bukkit.getScheduler().runTaskTimer(this, this::retryFailedSaves, FAILED_SAVE_RETRY_TICKS, FAILED_SAVE_RETRY_TICKS);
+        long refreshTicks = Math.max(5L, getConfig().getLong("entitlement-refresh-seconds", 15L)) * 20L;
+        Bukkit.getScheduler().runTaskTimer(this, this::pollEntitlements, refreshTicks, refreshTicks);
+        pendingStoreOpsFile = new File(getDataFolder(), "pending-store-ops.txt");
+        loadPendingStoreOps();
+        Bukkit.getScheduler().runTaskTimer(this, this::retryPendingStoreOps, 20L * 30L, 20L * 60L);
     }
 
     @Override
@@ -314,7 +324,16 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
     private void loadSettings() {
         prefix = color(getConfig().getString("prefix", "&b&lCIV&f&lPVP"));
-        storeUrl = getConfig().getString("store-url", "https://www.patreon.com/c/CivPVP");
+        storeUrl = getConfig().getString("store-url", "https://civpvp.net/store");
+        rarityRanks = new EnumMap<>(Rarity.class);
+        for (Rarity rarity : Rarity.values()) {
+            String fallback = switch (rarity) {
+                case COMMON -> "&7Iron";
+                case RARE -> "&bDiamond";
+                case EPIC, LEGENDARY -> "&dNetherite";
+            };
+            rarityRanks.put(rarity, getConfig().getString("store.rarity-ranks." + rarity.id, fallback));
+        }
         loreEditorUrl = getConfig().getString("lore-editor-url", "https://civpvp.net/lore-editor");
         prefixMaxLength = getConfig().getInt("prefix-max-length", 16);
         loreMaxLines = Math.max(1, getConfig().getInt("lore.max-lines", 30));
@@ -441,67 +460,67 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private void registerDefaults() {
-        tags.add(new NamedCosmetic("champion", "&#FFB000&l✦ ᴄʜᴀᴍᴘɪᴏɴ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("legend", "&#FFD166&l★ ʟᴇɢᴇɴᴅ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("knight", "&#9AD0FF&l⚔ ᴋɴɪɢʜᴛ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("royal", "&#B388FF&l♛ ʀᴏʏᴀʟ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("veteran", "&#A8A8A8&l✚ ᴠᴇᴛᴇʀᴀɴ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("builder", "&#F4A261&l▣ ʙᴜɪʟᴅᴇʀ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("hunter", "&#7ED957&l⌖ ʜᴜɴᴛᴇʀ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("titan", "&#56CCF2&l◆ ᴛɪᴛᴀɴ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("ember", "&#FF6B35&l🔥 ᴇᴍʙᴇʀ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("frost", "&#7FDBFF&l❄ ꜰʀᴏꜱᴛ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("void", "&#8E44AD&l✧ ᴠᴏɪᴅ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("crimson", "&#D7263D&l✦ ᴄʀɪᴍꜱᴏɴ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("lucky", "&#2ECC71&l☘ ʟᴜᴄᴋʏ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("celestial", "&#F8F7FF&l☾ ᴄᴇʟᴇꜱᴛɪᴀʟ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("rogue", "&#95A5A6&l⌁ ʀᴏɢᴜᴇ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("guardian", "&#00B894&l⬟ ɢᴜᴀʀᴅɪᴀɴ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("alchemist", "&#C3FF00&l⚗ ᴀʟᴄʜᴇᴍɪꜱᴛ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("voyager", "&#4D96FF&l✈ ᴠᴏʏᴀɢᴇʀ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("phantom", "&#BFC0FF&l☁ ᴘʜᴀɴᴛᴏᴍ &f", Material.NAME_TAG));
-        tags.add(new NamedCosmetic("reaper", "&#2D3436&l☠ ʀᴇᴀᴘᴇʀ &f", Material.NAME_TAG));
+        tags.add(new NamedCosmetic("champion", "&#FFB000&l✦ ᴄʜᴀᴍᴘɪᴏɴ &f", Material.NAME_TAG, Rarity.LEGENDARY));
+        tags.add(new NamedCosmetic("legend", "&#FFD166&l★ ʟᴇɢᴇɴᴅ &f", Material.NAME_TAG, Rarity.LEGENDARY));
+        tags.add(new NamedCosmetic("knight", "&#9AD0FF&l⚔ ᴋɴɪɢʜᴛ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("royal", "&#B388FF&l♛ ʀᴏʏᴀʟ &f", Material.NAME_TAG, Rarity.EPIC));
+        tags.add(new NamedCosmetic("veteran", "&#A8A8A8&l✚ ᴠᴇᴛᴇʀᴀɴ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("builder", "&#F4A261&l▣ ʙᴜɪʟᴅᴇʀ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("hunter", "&#7ED957&l⌖ ʜᴜɴᴛᴇʀ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("titan", "&#56CCF2&l◆ ᴛɪᴛᴀɴ &f", Material.NAME_TAG, Rarity.EPIC));
+        tags.add(new NamedCosmetic("ember", "&#FF6B35&l🔥 ᴇᴍʙᴇʀ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("frost", "&#7FDBFF&l❄ ꜰʀᴏꜱᴛ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("void", "&#8E44AD&l✧ ᴠᴏɪᴅ &f", Material.NAME_TAG, Rarity.EPIC));
+        tags.add(new NamedCosmetic("crimson", "&#D7263D&l✦ ᴄʀɪᴍꜱᴏɴ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("lucky", "&#2ECC71&l☘ ʟᴜᴄᴋʏ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("celestial", "&#F8F7FF&l☾ ᴄᴇʟᴇꜱᴛɪᴀʟ &f", Material.NAME_TAG, Rarity.LEGENDARY));
+        tags.add(new NamedCosmetic("rogue", "&#95A5A6&l⌁ ʀᴏɢᴜᴇ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("guardian", "&#00B894&l⬟ ɢᴜᴀʀᴅɪᴀɴ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("alchemist", "&#C3FF00&l⚗ ᴀʟᴄʜᴇᴍɪꜱᴛ &f", Material.NAME_TAG, Rarity.RARE));
+        tags.add(new NamedCosmetic("voyager", "&#4D96FF&l✈ ᴠᴏʏᴀɢᴇʀ &f", Material.NAME_TAG, Rarity.COMMON));
+        tags.add(new NamedCosmetic("phantom", "&#BFC0FF&l☁ ᴘʜᴀɴᴛᴏᴍ &f", Material.NAME_TAG, Rarity.EPIC));
+        tags.add(new NamedCosmetic("reaper", "&#2D3436&l☠ ʀᴇᴀᴘᴇʀ &f", Material.NAME_TAG, Rarity.EPIC));
 
-        killEffects.add(new NamedCosmetic("pig", "&d&lPIG ASCENSION", Material.PORKCHOP));
-        killEffects.add(new NamedCosmetic("dragon", "&5&lDRAGON", Material.DRAGON_EGG));
-        killEffects.add(new NamedCosmetic("thunder", "&b&lLIGHTNING", Material.LIGHTNING_ROD));
-        killEffects.add(new NamedCosmetic("flame", "&6&lFLAME", Material.CAMPFIRE));
-        killEffects.add(new NamedCosmetic("heartbeat", "&c&lHEARTBEAT", Material.RED_DYE));
-        killEffects.add(new NamedCosmetic("warden", "&3&lWARDEN", Material.WARDEN_SPAWN_EGG));
-        killEffects.add(new NamedCosmetic("firework", "&f&lFIREWORK", Material.FIREWORK_ROCKET));
-        killEffects.add(new NamedCosmetic("snow", "&b&lFROSTBITE", Material.POWDER_SNOW_BUCKET));
-        killEffects.add(new NamedCosmetic("trident", "&9&lTRIDENT", Material.TRIDENT));
-        killEffects.add(new NamedCosmetic("crystal", "&d&lCRYSTAL", Material.AMETHYST_CLUSTER));
-        killEffects.add(new NamedCosmetic("blood", "&4&lBLOOD EXPLOSION", Material.REDSTONE_BLOCK));
-        killEffects.add(new NamedCosmetic("explosion", "&4&lEXPLOSION", Material.TNT));
-        killEffects.add(new NamedCosmetic("void", "&d&lVOID", Material.ENDER_EYE));
-        killEffects.add(new NamedCosmetic("wealth", "&6&lWEALTH", Material.GOLD_INGOT));
-        killEffects.add(new NamedCosmetic("squid", "&0&lSQUID MISSILE", Material.INK_SAC));
-        killEffects.add(new NamedCosmetic("tornado", "&3&lVORTEX", Material.SCULK));
-        killEffects.add(new NamedCosmetic("lava", "&c&lLAVA", Material.MAGMA_CREAM));
-        killEffects.add(new NamedCosmetic("music", "&a&lMUSIC", Material.NOTE_BLOCK));
-        killEffects.add(new NamedCosmetic("cloud", "&f&lJUDGEMENT", Material.END_ROD));
-        killEffects.add(new NamedCosmetic("slime", "&2&lSLIME", Material.SLIME_BALL));
-        killEffects.add(new NamedCosmetic("cookies", "&6&lCOOKIE FOUNTAIN", Material.COOKIE));
-        killEffects.add(new NamedCosmetic("soul_rift", "&3&lSOUL RIFT", Material.SOUL_LANTERN));
-        killEffects.add(new NamedCosmetic("meteor", "&6&lMETEOR", Material.FIRE_CHARGE));
-        killEffects.add(new NamedCosmetic("shatter", "&b&lSHATTER", Material.BLUE_STAINED_GLASS));
-        killEffects.add(new NamedCosmetic("crown", "&e&lCROWN", Material.GOLDEN_HELMET));
-        killEffects.add(new NamedCosmetic("glitch", "&d&lGLITCH", Material.ENDER_PEARL));
-        killEffects.add(new NamedCosmetic("execution", "&4&lEXECUTION", Material.IRON_AXE));
+        killEffects.add(new NamedCosmetic("pig", "&d&lPIG ASCENSION", Material.PORKCHOP, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("dragon", "&5&lDRAGON", Material.DRAGON_EGG, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("thunder", "&b&lLIGHTNING", Material.LIGHTNING_ROD, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("flame", "&6&lFLAME", Material.CAMPFIRE, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("heartbeat", "&c&lHEARTBEAT", Material.RED_DYE, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("warden", "&3&lWARDEN", Material.WARDEN_SPAWN_EGG, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("firework", "&f&lFIREWORK", Material.FIREWORK_ROCKET, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("snow", "&b&lFROSTBITE", Material.POWDER_SNOW_BUCKET, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("trident", "&9&lTRIDENT", Material.TRIDENT, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("crystal", "&d&lCRYSTAL", Material.AMETHYST_CLUSTER, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("blood", "&4&lBLOOD EXPLOSION", Material.REDSTONE_BLOCK, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("explosion", "&4&lEXPLOSION", Material.TNT, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("void", "&d&lVOID", Material.ENDER_EYE, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("wealth", "&6&lWEALTH", Material.GOLD_INGOT, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("squid", "&0&lSQUID MISSILE", Material.INK_SAC, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("tornado", "&3&lVORTEX", Material.SCULK, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("lava", "&c&lLAVA", Material.MAGMA_CREAM, Rarity.RARE));
+        killEffects.add(new NamedCosmetic("music", "&a&lMUSIC", Material.NOTE_BLOCK, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("cloud", "&f&lJUDGEMENT", Material.END_ROD, Rarity.LEGENDARY));
+        killEffects.add(new NamedCosmetic("slime", "&2&lSLIME", Material.SLIME_BALL, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("cookies", "&6&lCOOKIE FOUNTAIN", Material.COOKIE, Rarity.COMMON));
+        killEffects.add(new NamedCosmetic("soul_rift", "&3&lSOUL RIFT", Material.SOUL_LANTERN, Rarity.LEGENDARY));
+        killEffects.add(new NamedCosmetic("meteor", "&6&lMETEOR", Material.FIRE_CHARGE, Rarity.LEGENDARY));
+        killEffects.add(new NamedCosmetic("shatter", "&b&lSHATTER", Material.BLUE_STAINED_GLASS, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("crown", "&e&lCROWN", Material.GOLDEN_HELMET, Rarity.LEGENDARY));
+        killEffects.add(new NamedCosmetic("glitch", "&d&lGLITCH", Material.ENDER_PEARL, Rarity.EPIC));
+        killEffects.add(new NamedCosmetic("execution", "&4&lEXECUTION", Material.IRON_AXE, Rarity.LEGENDARY));
 
-        trails.add(new NamedCosmetic("hearts", "&c&lHEART", Material.RED_DYE));
-        trails.add(new NamedCosmetic("flame", "&6&lFLAME", Material.BLAZE_POWDER));
-        trails.add(new NamedCosmetic("magic", "&d&lMAGIC", Material.GHAST_TEAR));
-        trails.add(new NamedCosmetic("music", "&a&lMUSIC", Material.NOTE_BLOCK));
-        trails.add(new NamedCosmetic("smoke", "&8&lSMOKE", Material.GUNPOWDER));
-        trails.add(new NamedCosmetic("crit", "&b&lCRIT", Material.DIAMOND_SWORD));
-        trails.add(new NamedCosmetic("slime", "&2&lSLIME", Material.SLIME_BALL));
-        trails.add(new NamedCosmetic("soul", "&3&lSOUL", Material.SOUL_TORCH));
-        trails.add(new NamedCosmetic("ender", "&5&lENDER", Material.ENDER_PEARL));
-        trails.add(new NamedCosmetic("gold", "&6&lGOLD", Material.GOLD_NUGGET));
-        trails.add(new NamedCosmetic("frost", "&b&lFROST", Material.SNOWBALL));
-        trails.add(new NamedCosmetic("totem", "&a&lTOTEM", Material.TOTEM_OF_UNDYING));
+        trails.add(new NamedCosmetic("hearts", "&c&lHEART", Material.RED_DYE, Rarity.COMMON));
+        trails.add(new NamedCosmetic("flame", "&6&lFLAME", Material.BLAZE_POWDER, Rarity.RARE));
+        trails.add(new NamedCosmetic("magic", "&d&lMAGIC", Material.GHAST_TEAR, Rarity.EPIC));
+        trails.add(new NamedCosmetic("music", "&a&lMUSIC", Material.NOTE_BLOCK, Rarity.COMMON));
+        trails.add(new NamedCosmetic("smoke", "&8&lSMOKE", Material.GUNPOWDER, Rarity.COMMON));
+        trails.add(new NamedCosmetic("crit", "&b&lCRIT", Material.DIAMOND_SWORD, Rarity.RARE));
+        trails.add(new NamedCosmetic("slime", "&2&lSLIME", Material.SLIME_BALL, Rarity.COMMON));
+        trails.add(new NamedCosmetic("soul", "&3&lSOUL", Material.SOUL_TORCH, Rarity.EPIC));
+        trails.add(new NamedCosmetic("ender", "&5&lENDER", Material.ENDER_PEARL, Rarity.LEGENDARY));
+        trails.add(new NamedCosmetic("gold", "&6&lGOLD", Material.GOLD_NUGGET, Rarity.RARE));
+        trails.add(new NamedCosmetic("frost", "&b&lFROST", Material.SNOWBALL, Rarity.RARE));
+        trails.add(new NamedCosmetic("totem", "&a&lTOTEM", Material.TOTEM_OF_UNDYING, Rarity.LEGENDARY));
 
         killMessagePresets.add(new KillMessagePreset("classic", "&e&lClassic", Material.PAPER, "&8{victim} &7was killed by &8{killer} &7{item}"));
         killMessagePresets.add(new KillMessagePreset("deleted", "&c&lDeleted", Material.TNT, "&c{victim} &7was deleted by &6{killer} &7{item}"));
@@ -512,6 +531,26 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
         trimPatterns.addAll(List.of("coast", "dune", "eye", "rib", "sentry", "snout", "spire", "tide", "vex", "ward", "wild", "wayfinder", "raiser", "shaper", "host", "silence", "bolt", "flow"));
         trimMaterials.addAll(List.of("amethyst", "copper", "diamond", "emerald", "gold", "iron", "lapis", "netherite", "quartz", "redstone"));
+    }
+
+    /** Optional config overrides: {@code cosmetic-rarities.<category>.<id>: common|rare|epic|legendary}. */
+    private void applyRarityOverrides() {
+        ConfigurationSection section = getConfig().getConfigurationSection("cosmetic-rarities");
+        if (section == null) return;
+        for (Category category : List.of(Category.KILL_EFFECTS, Category.TRAILS, Category.TAGS)) {
+            ConfigurationSection overrides = section.getConfigurationSection(category.id);
+            if (overrides == null) continue;
+            List<NamedCosmetic> list = categoryCosmetics(category);
+            for (String id : overrides.getKeys(false)) {
+                Rarity rarity = Rarity.parse(overrides.getString(id));
+                NamedCosmetic cosmetic = find(list, id.toLowerCase(Locale.ROOT));
+                if (rarity == null || cosmetic == null) {
+                    getLogger().warning("Ignoring cosmetic-rarities." + category.id + "." + id + ": unknown cosmetic or rarity.");
+                    continue;
+                }
+                list.set(list.indexOf(cosmetic), new NamedCosmetic(cosmetic.id(), cosmetic.display(), cosmetic.icon(), rarity, cosmetic.founder()));
+            }
+        }
     }
 
     @Override
@@ -601,6 +640,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private boolean cosAdmin(CommandSender sender, String[] args) {
+        if (args.length > 0 && STORE_SUBCOMMANDS.contains(args[0].toLowerCase(Locale.ROOT))) {
+            return storeCommand(sender, args);
+        }
         if (!sender.hasPermission("civ.cosmetic.admin")) {
             msg(sender, "&cNo permission!");
             return true;
@@ -612,7 +654,20 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(sender, "&e/cosadmin preset <player> <preset> [replace]");
             msg(sender, "&e/cosadmin grantall <player> [loreCredits]");
             msg(sender, "&e/cosadmin patreon <player>");
+            msg(sender, "&e/cosadmin ledger <player|uuid> &7- recent store purchases");
             msg(sender, "&e/cosadmingui");
+            msg(sender, "&7Console only: &e/cosadmin token <uuid> <rarity> <amount> <transaction> [package]");
+            msg(sender, "&7Console only: &e/cosadmin founder <uuid> <transaction> [package]");
+            msg(sender, "&7Console only: &e/cosadmin refund <transaction>");
+            msg(sender, "&7Console only: &e/addlorecredit <uuid> <amount> <transaction> [package]");
+            return true;
+        }
+        if (args[0].equalsIgnoreCase("ledger")) {
+            if (args.length < 2) {
+                msg(sender, "&cUsage: /cosadmin ledger <player|uuid>");
+                return true;
+            }
+            resolveTarget(sender, args[1], target -> showLedger(sender, target));
             return true;
         }
         if (args.length < 2) {
@@ -629,11 +684,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         if (args[0].equalsIgnoreCase("grantall") || args[0].equalsIgnoreCase("patreon")) {
             int loreCredits = args[0].equalsIgnoreCase("patreon") ? 1 : (args.length > 2 ? parseInt(args[2], 0) : 0);
             grantAll(data);
-            data.loreCredits += Math.max(0, loreCredits);
+            adjustLoreCredits(data, Math.max(0, loreCredits));
             saveWithGrants(data);
             Player online = target.getPlayer();
             if (online != null) validateSelections(online);
-            msg(sender, "&aGranted all cosmetics to &f" + target.getName() + " &7(+" + Math.max(0, loreCredits) + " lore credits)");
+            msg(sender, "&aGranted all cosmetics to &f" + playerName(target.getUniqueId()) + " &7(+" + Math.max(0, loreCredits) + " lore credits)");
             return true;
         }
         if (args[0].equalsIgnoreCase("preset")) {
@@ -652,7 +707,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             saveWithGrants(data);
             Player online = target.getPlayer();
             if (online != null) validateSelections(online);
-            msg(sender, "&aApplied &e" + preset.id + " &ato &f" + target.getName() + (replace ? " &7(replaced old grants)" : ""));
+            msg(sender, "&aApplied &e" + preset.id + " &ato &f" + playerName(target.getUniqueId()) + (replace ? " &7(replaced old grants)" : ""));
             return true;
         }
         if (args.length < 3) {
@@ -669,20 +724,20 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             data.grant(category, id);
             if (category == Category.TAGS && id.equals("all")) data.grant(Category.TITLE, "all");
             saveWithGrants(data);
-            msg(sender, "&aGranted &e" + category.id + ":" + id + " &ato &f" + target.getName());
+            msg(sender, "&aGranted &e" + category.id + ":" + id + " &ato &f" + playerName(target.getUniqueId()));
         } else if (args[0].equalsIgnoreCase("revoke")) {
             data.revoke(category, id);
             if (category == Category.TAGS && id.equals("all")) data.revoke(Category.TITLE, "all");
             saveWithGrants(data);
             Player online = target.getPlayer();
             if (online != null) validateSelections(online);
-            msg(sender, "&cRevoked &e" + category.id + ":" + id + " &cfrom &f" + target.getName());
+            msg(sender, "&cRevoked &e" + category.id + ":" + id + " &cfrom &f" + playerName(target.getUniqueId()));
         } else if (args[0].equalsIgnoreCase("clear")) {
             clearCategoryGrants(data, category);
             saveWithGrants(data);
             Player online = target.getPlayer();
             if (online != null) validateSelections(online);
-            msg(sender, "&cCleared " + category.id + " grants from " + target.getName());
+            msg(sender, "&cCleared " + category.id + " grants from " + playerName(target.getUniqueId()));
         }
         return true;
     }
@@ -709,7 +764,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             save(data);
             Player online = target.getPlayer();
             if (online != null) applyPrefix(online);
-            msg(sender, "&eCleared title for " + target.getName());
+            msg(sender, "&eCleared title for " + playerName(target.getUniqueId()));
         } else if (args[0].equalsIgnoreCase("set")) {
             if (args.length < 3) {
                 msg(sender, "&cUsage: /titleadmin set <player> <prefix>");
@@ -727,12 +782,29 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             saveWithGrants(data);
             Player online = target.getPlayer();
             if (online != null) applyPrefix(online);
-            msg(sender, "&aSet title for " + target.getName() + ": &r" + raw);
+            msg(sender, "&aSet title for " + playerName(target.getUniqueId()) + ": &r" + raw);
         }
         return true;
     }
 
     private boolean addLoreCredit(CommandSender sender, String[] args) {
+        if (args.length >= 3) {
+            // With a transaction id this is a store delivery: console only, UUID only, recorded in the ledger.
+            if (!isConsole(sender)) {
+                msg(sender, "&cStore deliveries can only be run from the server console.");
+                return true;
+            }
+            UUID uuid = Store.parseUuid(args[0]);
+            int amount = parseInt(args[1], 0);
+            String transaction = args[2];
+            String packageId = args.length > 3 ? args[3].toLowerCase(Locale.ROOT) : "lore_" + amount;
+            if (uuid == null || amount <= 0 || amount > 64 || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
+                msg(sender, "&cUsage: /addlorecredit <uuid> <amount 1-64> <transaction> [package]");
+                return true;
+            }
+            submitStoreOp(sender, new StoreOp(Store.KIND_LORE, uuid, null, amount, transaction, packageId));
+            return true;
+        }
         if (!sender.hasPermission("civ.cosmetic.admin")) {
             msg(sender, "&cNo permission!");
             return true;
@@ -753,10 +825,205 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private boolean addLoreCredit(CommandSender sender, OfflinePlayer target, int amount) {
         if (!requireLoaded(sender, target.getUniqueId(), () -> addLoreCredit(sender, target, amount))) return true;
         PlayerData data = load(target.getUniqueId());
-        data.loreCredits += amount;
-        save(data);
-        msg(sender, "&aAdded &e" + amount + " &alore credits to &f" + target.getName());
+        adjustLoreCredits(data, amount);
+        msg(sender, "&aAdded &e" + amount + " &alore credits to &f" + playerName(target.getUniqueId()));
         return true;
+    }
+
+    private static final Set<String> STORE_SUBCOMMANDS = Set.of("token", "founder", "refund");
+
+    private static boolean isConsole(CommandSender sender) {
+        return sender instanceof ConsoleCommandSender || sender instanceof RemoteConsoleCommandSender;
+    }
+
+    /**
+     * Store fulfilment (Tebex). Console only, so no player permission can mint tokens or credits. Every delivery is
+     * keyed by (transaction, package) in the purchase ledger, so a repeated command changes nothing.
+     */
+    private boolean storeCommand(CommandSender sender, String[] args) {
+        if (!isConsole(sender)) {
+            msg(sender, "&cStore commands can only be run from the server console.");
+            return true;
+        }
+        String sub = args[0].toLowerCase(Locale.ROOT);
+        switch (sub) {
+            case "token" -> {
+                UUID uuid = args.length > 1 ? Store.parseUuid(args[1]) : null;
+                Rarity rarity = args.length > 2 ? Rarity.parse(args[2]) : null;
+                int amount = args.length > 3 ? parseInt(args[3], 0) : 0;
+                String transaction = args.length > 4 ? args[4] : null;
+                String packageId = args.length > 5 ? args[5].toLowerCase(Locale.ROOT) : rarity == null ? null : "token_" + rarity.id;
+                if (uuid == null || rarity == null || amount <= 0 || amount > 64
+                    || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
+                    msg(sender, "&cUsage: /cosadmin token <uuid> <common|rare|epic|legendary> <amount 1-64> <transaction> [package]");
+                    return true;
+                }
+                submitStoreOp(sender, new StoreOp(Store.KIND_TOKEN, uuid, rarity, amount, transaction, packageId));
+            }
+            case "founder" -> {
+                UUID uuid = args.length > 1 ? Store.parseUuid(args[1]) : null;
+                String transaction = args.length > 2 ? args[2] : null;
+                String packageId = args.length > 3 ? args[3].toLowerCase(Locale.ROOT) : "founder";
+                if (uuid == null || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
+                    msg(sender, "&cUsage: /cosadmin founder <uuid> <transaction> [package]");
+                    return true;
+                }
+                submitStoreOp(sender, new StoreOp(Store.KIND_FOUNDER, uuid, null, 1, transaction, packageId));
+            }
+            case "refund" -> {
+                String transaction = args.length > 1 ? args[1] : null;
+                if (!Store.validTransaction(transaction)) {
+                    msg(sender, "&cUsage: /cosadmin refund <transaction>");
+                    return true;
+                }
+                submitStoreOp(sender, new StoreOp(StoreOp.REFUND, null, null, 0, transaction, "-"));
+            }
+            default -> msg(sender, "&cUnknown store command.");
+        }
+        return true;
+    }
+
+    private void submitStoreOp(CommandSender sender, StoreOp op) {
+        if (!storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) {
+            queueStoreOp(op, "storage unavailable");
+            msg(sender, "&eStorage unavailable; " + op.describe() + " was queued and will be retried.");
+            return;
+        }
+        storageExecutor.execute(() -> {
+            try {
+                String result = withRetry(() -> applyStoreOp(op));
+                getLogger().info("[Store] " + op.describe() + ": " + result);
+                if (isEnabled()) Bukkit.getScheduler().runTask(this, () -> {
+                    msg(sender, "&a" + op.describe() + ": &f" + result);
+                    afterStoreOp(op);
+                });
+            } catch (RuntimeException e) {
+                queueStoreOp(op, e.getMessage());
+                if (isEnabled()) Bukkit.getScheduler().runTask(this, () ->
+                    msg(sender, "&e" + op.describe() + " could not be written yet; it was queued and will be retried."));
+            }
+        });
+    }
+
+    /** Storage thread. Returns a one-line result for the console and log. */
+    private String applyStoreOp(StoreOp op) {
+        return switch (op.kind()) {
+            case Store.KIND_TOKEN -> outcome(storage.grantTokens(op.uuid(), op.rarity(), op.amount(), op.transactionId(), op.packageId()),
+                op.amount() + " " + op.rarity().label + " token(s)");
+            case Store.KIND_LORE -> outcome(storage.grantLoreCredits(op.uuid(), op.amount(), op.transactionId(), op.packageId()),
+                op.amount() + " lore credit(s)");
+            case Store.KIND_FOUNDER -> outcome(storage.recordFounder(op.uuid(), op.transactionId(), op.packageId()),
+                "Founder purchase recorded");
+            case StoreOp.REFUND -> {
+                Store.RefundResult result = storage.refund(op.transactionId());
+                if (result.nothingToRefund()) yield "nothing to refund (unknown or already refunded)";
+                yield "refunded " + result.rows() + " ledger row(s); removed " + result.tokensRemoved() + " unspent token(s), "
+                    + result.cosmeticsRevoked() + " redeemed cosmetic(s), " + result.loreCreditsRemoved() + " lore credit(s)"
+                    + (result.loreCreditShortfall() > 0 ? " (" + result.loreCreditShortfall() + " already spent)" : "");
+            }
+            default -> throw new IllegalArgumentException("Unknown store operation " + op.kind());
+        };
+    }
+
+    private static String outcome(Store.Outcome outcome, String what) {
+        return outcome == Store.Outcome.APPLIED ? "granted " + what : "already delivered; ignored";
+    }
+
+    /** Main thread: show the change to an online player now instead of waiting for the next poll. */
+    private void afterStoreOp(StoreOp op) {
+        if (op.uuid() == null) {
+            pollEntitlements();
+            return;
+        }
+        refreshEntitlements(op.uuid(), null);
+    }
+
+    private void queueStoreOp(StoreOp op, @Nullable String reason) {
+        getLogger().severe("[Store] Could not apply " + op.describe() + " (" + reason + "); queued in "
+            + pendingStoreOpsFile.getName() + " for retry.");
+        synchronized (pendingStoreOps) {
+            pendingStoreOps.add(op);
+            writePendingStoreOps();
+        }
+    }
+
+    private void loadPendingStoreOps() {
+        if (!pendingStoreOpsFile.isFile()) return;
+        try {
+            synchronized (pendingStoreOps) {
+                for (String line : Files.readAllLines(pendingStoreOpsFile.toPath(), StandardCharsets.UTF_8)) {
+                    StoreOp op = StoreOp.parse(line);
+                    if (op != null) pendingStoreOps.add(op);
+                    else if (!line.isBlank()) getLogger().severe("[Store] Unreadable queued store operation: " + line);
+                }
+            }
+            if (!pendingStoreOps.isEmpty()) {
+                getLogger().warning("[Store] " + pendingStoreOps.size() + " queued store operation(s) will be retried.");
+            }
+        } catch (IOException e) {
+            getLogger().severe("[Store] Could not read " + pendingStoreOpsFile + ": " + e.getMessage());
+        }
+    }
+
+    /** Caller holds the pendingStoreOps lock. Writes atomically so a crash can't leave a half-written queue. */
+    private void writePendingStoreOps() {
+        try {
+            getDataFolder().mkdirs();
+            File temp = new File(getDataFolder(), pendingStoreOpsFile.getName() + ".tmp");
+            List<String> lines = new ArrayList<>();
+            for (StoreOp op : pendingStoreOps) lines.add(op.serialize());
+            Files.write(temp.toPath(), lines, StandardCharsets.UTF_8);
+            Files.move(temp.toPath(), pendingStoreOpsFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            getLogger().severe("[Store] Could not write " + pendingStoreOpsFile + ": " + e.getMessage());
+        }
+    }
+
+    /** Main thread, periodic. */
+    private void retryPendingStoreOps() {
+        List<StoreOp> queued;
+        synchronized (pendingStoreOps) {
+            if (pendingStoreOps.isEmpty()) return;
+            queued = new ArrayList<>(pendingStoreOps);
+        }
+        if (!storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) return;
+        storageExecutor.execute(() -> {
+            for (StoreOp op : queued) {
+                try {
+                    String result = applyStoreOp(op);
+                    getLogger().info("[Store] Retried " + op.describe() + ": " + result);
+                    synchronized (pendingStoreOps) {
+                        pendingStoreOps.remove(op);
+                        writePendingStoreOps();
+                    }
+                    if (isEnabled()) Bukkit.getScheduler().runTask(this, () -> afterStoreOp(op));
+                } catch (RuntimeException e) {
+                    logStorageFailure("retry " + op.describe(), op.uuid(), e);
+                    return;
+                }
+            }
+        });
+    }
+
+    private void showLedger(CommandSender sender, OfflinePlayer target) {
+        UUID uuid = target.getUniqueId();
+        runStorage("read the purchase ledger", uuid, () -> storage.ledger(uuid, 15), entries -> {
+            msg(sender, "&6Store purchases for &f" + playerName(uuid) + " &7(" + uuid + ")");
+            if (entries.isEmpty()) {
+                msg(sender, "&7No store purchases recorded.");
+                return;
+            }
+            for (Store.LedgerEntry entry : entries) {
+                String what = switch (entry.kind()) {
+                    case Store.KIND_TOKEN -> entry.amount() + "x " + entry.rarity() + " token (" + entry.spent() + " spent)";
+                    case Store.KIND_LORE -> entry.amount() + " lore credit(s)";
+                    default -> entry.kind();
+                };
+                msg(sender, (Store.STATUS_REFUNDED.equals(entry.status()) ? "&c" : "&a") + entry.status()
+                    + " &7" + entry.transactionId() + " &8/ &7" + entry.packageId() + " &f" + what
+                    + (entry.note() == null ? "" : " &8(" + entry.note() + ")"));
+            }
+        }, () -> msg(sender, "&cCould not read the purchase ledger right now."));
     }
 
     /**
@@ -764,6 +1031,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
      * anything else is looked up asynchronously (which may hit Mojang) and the action runs back on the main thread.
      */
     private void resolveTarget(CommandSender sender, String name, Consumer<OfflinePlayer> action) {
+        UUID uuid = Store.parseUuid(name);
+        if (uuid != null) {
+            // A UUID needs no lookup and works for players who are offline or have never joined this server.
+            action.accept(Bukkit.getOfflinePlayer(uuid));
+            return;
+        }
         Player online = Bukkit.getPlayerExact(name);
         if (online != null) {
             action.accept(online);
@@ -813,7 +1086,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         msg(sender, "&e/setlore draft remove <lineNumber> &7- remove a draft line.");
         msg(sender, "&e/setlore draft preview|apply|clear &7- finish or clear draft.");
         msg(sender, "&e/setlore editor &7- lore editor: &b" + loreEditorUrl);
-        msg(sender, "&eStore/Patreon: &b" + storeUrl);
+        msg(sender, "&eStore: &b" + storeUrl + " &7(ranks, tokens, lore credits)");
         if (sender.hasPermission("civ.cosmetic.admin")) {
             msg(sender, "&6&lAdmin");
             msg(sender, "&e/cosadmin help &7- grant/revoke/preset commands.");
@@ -821,7 +1094,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(sender, "&e/cosadmin grantall <player> [loreCredits] &7- grant all cosmetics.");
             msg(sender, "&e/cosadmin patreon <player> &7- grant all cosmetics + one lore credit.");
             msg(sender, "&e/titleadmin set|clear <player> [prefix] &7- manage player title.");
-            msg(sender, "&e/addlorecredit <player> [amount] &7- add lore credits.");
+            msg(sender, "&e/addlorecredit <player|uuid> [amount] &7- add lore credits.");
+            msg(sender, "&e/cosadmin ledger <player|uuid> &7- recent store purchases.");
+            msg(sender, "&7Store deliveries and refunds are console-only; see /cosadmin help.");
         }
     }
 
@@ -921,8 +1196,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private void previewLore(Player player, String raw) {
-        if (!has(player, Category.LORE, "item")) {
-            msg(player, "&cYou do not have access to custom item lore.");
+        if (!canUseLore(player)) {
+            msg(player, "&cYou need a Lore Credit to customize items. Get one at &e" + storeUrl + "&c.");
             return;
         }
         ItemStack item = player.getInventory().getItemInMainHand();
@@ -1114,6 +1389,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
         if (!player.isOp()) {
             data.loreCredits--;
+            UUID uuid = player.getUniqueId();
+            runStorage("spend a lore credit", uuid, () -> storage.spendLoreCredit(uuid), spent -> {
+                if (!spent) getLogger().warning("Lore credit for " + uuid + " was already spent on another server; lore was applied anyway.");
+            }, null);
         }
         save(data);
         msg(player, "&aItem updated. &eLore Credit consumed.");
@@ -1183,247 +1462,755 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         item.setItemMeta(meta);
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // Player menus. Every browsing menu shares one frame: six rows, a border, the player's profile in the top centre,
+    // a 7x4 content area laid out symmetrically, and navigation in fixed bottom-row slots (Back 45, Previous 48,
+    // Close 49, Next 50, Store 53, with paired actions in 47 and 51). Confirmation dialogs share one three-row
+    // layout: confirm on the left, the subject in the centre, cancel on the right.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private static final int SLOT_PROFILE = 4;
+    private static final int SLOT_BACK = 45;
+    private static final int SLOT_LEFT_ACTION = 47;
+    private static final int SLOT_PREVIOUS = 48;
+    private static final int SLOT_CLOSE = 49;
+    private static final int SLOT_NEXT = 50;
+    private static final int SLOT_RIGHT_ACTION = 51;
+    private static final int SLOT_STORE = 53;
+    private Inventory frame(Player player, Menu menu, String title, @Nullable Object data) {
+        Inventory inv = gui(menu, 54, "&8" + title, data);
+        ItemStack border = item(Material.BLACK_STAINED_GLASS_PANE, " ");
+        for (int slot = 0; slot < 54; slot++) {
+            int row = slot / 9;
+            int column = slot % 9;
+            if (row == 0 || row == 5 || column == 0 || column == 8) inv.setItem(slot, border);
+        }
+        inv.setItem(SLOT_PROFILE, profileItem(player));
+        button(inv, SLOT_CLOSE, item(Material.BARRIER, "&c&lClose"), click -> player.closeInventory());
+        return inv;
+    }
+
+    private Inventory dialog(Menu menu, String title) {
+        Inventory inv = gui(menu, 27, "&8" + title, null);
+        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
+        return inv;
+    }
+
+    private void button(Inventory inv, int slot, ItemStack item, Consumer<ClickType> action) {
+        inv.setItem(slot, item);
+        ((GuiHolder) inv.getHolder()).actions.put(slot, action);
+    }
+
+    private void backButton(Inventory inv, String target, Runnable action) {
+        button(inv, SLOT_BACK, item(Material.ARROW, "&7« Back", "&8To " + target), click -> action.run());
+    }
+
+    private void storeButton(Inventory inv, Player player) {
+        button(inv, SLOT_STORE, item(Material.EMERALD, "&a&lStore",
+            "&7Ranks, cosmetic tokens", "&7and lore credits.", "", "&b" + storeHost(), "", "&eClick for the link"), click -> {
+            player.closeInventory();
+            player.sendMessage(component(prefix + " &r&7Visit the store: &b&n" + storeUrl)
+                .clickEvent(ClickEvent.openUrl(storeUrl))
+                .hoverEvent(HoverEvent.showText(component("&eClick to open the store"))));
+        });
+    }
+
+    private void pageButtons(Inventory inv, int page, int pages, Consumer<Integer> open) {
+        if (page > 1) button(inv, SLOT_PREVIOUS, item(Material.ARROW, "&e« Previous Page", "&7Page " + (page - 1) + " of " + pages), click -> open.accept(page - 1));
+        if (page < pages) button(inv, SLOT_NEXT, item(Material.ARROW, "&eNext Page »", "&7Page " + (page + 1) + " of " + pages), click -> open.accept(page + 1));
+    }
+
+    private String storeHost() {
+        return storeUrl.replaceFirst("^https?://", "").replaceFirst("^www\\.", "");
+    }
+
+    private ItemStack profileItem(Player player) {
+        PlayerData data = data(player);
+        String rank = vaultPrefix(player).strip();
+        List<String> lore = new ArrayList<>();
+        lore.add("&7Rank: " + (rank.isEmpty() ? "&fMember" : rank));
+        lore.add("&7Title: &f" + currentPrefixText(data));
+        lore.add("");
+        lore.add("&7Lore Credits: &e" + data.loreCredits);
+        lore.add("&7Tokens:");
+        for (Rarity rarity : Rarity.values()) {
+            lore.add("&8 ▪ " + rarity.display() + " &8× &f" + data.tokens(rarity));
+        }
+        ItemStack head = new ItemStack(Material.PLAYER_HEAD);
+        SkullMeta meta = (SkullMeta) head.getItemMeta();
+        meta.setOwningPlayer(player);
+        meta.displayName(component("&e&l" + player.getName()));
+        meta.lore(lore.stream().map(this::component).toList());
+        head.setItemMeta(meta);
+        return head;
+    }
+
+    private ItemStack glow(ItemStack stack, boolean glow) {
+        if (!glow) return stack;
+        ItemMeta meta = stack.getItemMeta();
+        meta.setEnchantmentGlintOverride(true);
+        stack.setItemMeta(meta);
+        return stack;
+    }
+
+    private String perkRank(String perk, String fallback) {
+        return getConfig().getString("store.perk-ranks." + perk, fallback);
+    }
+
+    private void deny(Player player, String message) {
+        msg(player, message);
+        player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, .8f, 1f);
+    }
+
+    private static String titleCase(String raw) {
+        StringBuilder out = new StringBuilder();
+        for (String word : raw.split("[_ ]")) {
+            if (word.isEmpty()) continue;
+            if (!out.isEmpty()) out.append(' ');
+            out.append(Character.toUpperCase(word.charAt(0))).append(word.substring(1));
+        }
+        return out.toString();
+    }
+
+    // --- Hub ---
+
     private void openHub(Player player) {
         PlayerData data = data(player);
-        Inventory inv = gui(Menu.HUB, 27, "&8> &6Main Cosmetics Hub", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        inv.setItem(4, headItem(player.getUniqueId(), "&6&lYour Profile", "&7Lore Credits: &e" + data.loreCredits));
-        inv.setItem(10, item(Material.TNT, "&6&lKill Effects", "&7Customize your finishing moves.", "", "&eClick to open."));
-        inv.setItem(11, item(Material.COAST_ARMOR_TRIM_SMITHING_TEMPLATE, "&b&lArmor Trims", "&7Style your armor.", "", "&eClick to open."));
-        inv.setItem(12, item(Material.NAME_TAG, "&d&lPrefixes", "&7Current: &f" + currentPrefixText(data), "&7Choose a preset or create a custom prefix.", "", "&eClick to open."));
-        inv.setItem(13, item(Material.DIAMOND_SWORD, "&f&lCustom Lore", "&7Credits: &e" + data.loreCredits, "&7Includes examples, history, and item cleanup.", "", "&eClick to open."));
-        inv.setItem(14, item(Material.ARROW, "&e&lProjectile Trails", "&7Customize arrows and pearls.", "", "&eClick to open."));
-        inv.setItem(15, item(Material.PAPER, "&c&lKill Messages", "&7Current: &f" + currentKillMessageText(data), "&7Select preset death messages.", "", "&eClick to open."));
-        inv.setItem(16, item(Material.GOLD_INGOT, "&d&lPATREON", "&7Support the server.", "", "&eClick for link."));
+        Inventory inv = frame(player, Menu.HUB, "CivPvP ▸ Cosmetics", null);
+        button(inv, 20, categoryTile(player, Category.TAGS, Material.NAME_TAG, "&d&lTitles",
+            "Show a title in front of your name.", currentPrefixText(data)), click -> openTags(player, 1));
+        button(inv, 22, categoryTile(player, Category.KILL_EFFECTS, Material.TNT, "&c&lKill Effects",
+            "Play an effect when you get a kill.", selectedName(killEffects, data.selectedKillEffect)), click -> openKillEffects(player, 1));
+        button(inv, 24, categoryTile(player, Category.TRAILS, Material.ARROW, "&e&lProjectile Trails",
+            "Leave a trail behind arrows and pearls.", selectedName(trails, data.selectedTrail)), click -> openTrails(player, 1));
+
+        boolean trims = has(player, Category.TRIM, "all");
+        button(inv, 29, item(Material.COAST_ARMOR_TRIM_SMITHING_TEMPLATE, "&b&lArmor Trims",
+            "&7Apply any trim pattern and material", "&7to the armor in your hand.", "",
+            trims ? "&a✔ Unlocked" : "&c✖ Locked",
+            trims ? "&eClick while holding armor" : "&7Included with the " + perkRank("trim", "&bDiamond") + " &7rank."),
+            click -> {
+                if (!has(player, Category.TRIM, "all")) deny(player, "&cArmor trims are included with the " + perkRank("trim", "&bDiamond") + " &crank.");
+                else openTrimPatterns(player);
+            });
+        boolean killMessages = has(player, Category.KILLMSG, "all");
+        button(inv, 31, item(Material.PAPER, "&6&lKill Messages",
+            "&7Choose what chat says when", "&7you take someone down.", "",
+            "&7Equipped: &f" + currentKillMessageText(data), "",
+            killMessages ? "&eClick to browse" : "&7Included with the " + perkRank("killmsg", "&dNetherite") + " &7rank."),
+            click -> openKillMessages(player));
+        button(inv, 33, item(Material.WRITABLE_BOOK, "&f&lItem Lore",
+            "&7Rename an item and give it", "&7your own lore.", "",
+            "&7Lore Credits: &e" + data.loreCredits, "", "&eClick to open"), click -> openLoreMenu(player));
+
+        int totalTokens = 0;
+        for (Rarity rarity : Rarity.values()) totalTokens += data.tokens(rarity);
+        List<String> tokenLore = new ArrayList<>(List.of("&7Each token unlocks one cosmetic", "&7of its rarity, forever.", ""));
+        for (Rarity rarity : Rarity.values()) tokenLore.add("&8 ▪ " + rarity.display() + " &8× &f" + data.tokens(rarity));
+        tokenLore.add("");
+        tokenLore.add("&eClick for details");
+        button(inv, 40, glow(item(Material.SUNFLOWER, "&6&lTokens &7(" + totalTokens + ")", tokenLore.toArray(String[]::new)), totalTokens > 0),
+            click -> openTokens(player));
+
+        button(inv, SLOT_BACK, item(Material.BOOK, "&e&lHelp", "&7Commands and tips.", "", "&eClick to show in chat"), click -> {
+            player.closeInventory();
+            sendCosmeticsHelp(player);
+        });
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
+    private ItemStack categoryTile(Player player, Category category, Material icon, String name, String description, String equipped) {
+        List<NamedCosmetic> list = categoryCosmetics(category);
+        int unlocked = 0;
+        for (NamedCosmetic cosmetic : list) if (has(player, category, cosmetic.id())) unlocked++;
+        return item(icon, name,
+            "&7" + description, "",
+            "&7Unlocked: &a" + unlocked + "&7/&f" + list.size(),
+            "&7Equipped: &f" + equipped, "",
+            "&eClick to browse");
+    }
+
+    private String selectedName(List<NamedCosmetic> list, @Nullable String id) {
+        NamedCosmetic cosmetic = id == null ? null : find(list, id);
+        return cosmetic == null ? "&7None" : cosmetic.display();
+    }
+
+    // --- Cosmetic lists (titles, kill effects, trails) ---
+
     private void openKillEffects(Player player) {
-        Inventory inv = gui(Menu.KILL_EFFECTS, 54, "&6&lKill Effects &8- &eCIVPVP", null);
-        fill(inv, Material.GRAY_STAINED_GLASS_PANE);
-        PlayerData data = data(player);
-        for (int i = 0; i < killEffects.size() && i < EFFECT_SLOTS.size(); i++) {
-            NamedCosmetic effect = killEffects.get(i);
-            boolean selected = effect.id.equals(data.selectedKillEffect);
-            boolean owned = has(player, Category.KILL_EFFECTS, effect.id);
-            inv.setItem(EFFECT_SLOTS.get(i), item(selected ? Material.LIME_DYE : effect.icon, effect.display + (selected ? " &7(&aSelected&7)" : owned ? " &7(&eUnlocked&7)" : " &7(&cLocked&7)"),
-                owned ? "&7Left click to select." : "&cLocked.",
-                owned ? "&7Right click to preview." : "&7Requires civ.cosmetic.killeffects." + effect.id));
-        }
-        inv.setItem(49, item(Material.BARRIER, "&c&lCLEAR EFFECT"));
-        player.openInventory(inv);
+        openKillEffects(player, 1);
+    }
+
+    private void openKillEffects(Player player, int page) {
+        openCosmeticList(player, Category.KILL_EFFECTS, page);
     }
 
     private void openTrails(Player player) {
-        Inventory inv = gui(Menu.TRAILS, 36, "&8> &6Projectile Trails", null);
-        fill(inv, Material.GRAY_STAINED_GLASS_PANE);
-        PlayerData data = data(player);
-        for (int i = 0; i < trails.size() && i < TRAIL_SLOTS.size(); i++) {
-            NamedCosmetic trail = trails.get(i);
-            boolean selected = trail.id.equals(data.selectedTrail);
-            boolean owned = has(player, Category.TRAILS, trail.id);
-            inv.setItem(TRAIL_SLOTS.get(i), item(selected ? Material.LIME_DYE : trail.icon, trail.display + " TRAIL" + (selected ? " &7(&aSelected&7)" : owned ? " &7(&eUnlocked&7)" : " &7(&cLocked&7)"),
-                owned ? "&7Left click to select." : "&cLocked.",
-                owned ? "&7Right click to preview." : "&7Requires civ.cosmetic.trails." + trail.id));
-        }
-        inv.setItem(31, item(Material.BARRIER, "&c&lCLEAR TRAIL"));
-        player.openInventory(inv);
+        openTrails(player, 1);
+    }
+
+    private void openTrails(Player player, int page) {
+        openCosmeticList(player, Category.TRAILS, page);
     }
 
     private void openTags(Player player, int page) {
-        page = Math.max(1, page);
-        Inventory inv = gui(Menu.TAGS, 54, "&8> &6Prefixes &8Page " + page, page);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        int offset = (page - 1) * TAG_SLOTS.size();
+        openCosmeticList(player, Category.TAGS, page);
+    }
+
+    /** Store order: Common to Legendary, then Founder exclusives; ties keep their configured order. */
+    private List<NamedCosmetic> sortedCosmetics(Category category) {
+        List<NamedCosmetic> sorted = new ArrayList<>(categoryCosmetics(category));
+        sorted.sort((a, b) -> {
+            if (a.founder() != b.founder()) return a.founder() ? 1 : -1;
+            return Integer.compare(a.rarity().ordinal(), b.rarity().ordinal());
+        });
+        return sorted;
+    }
+
+    private void openCosmeticList(Player player, Category category, int requestedPage) {
+        List<NamedCosmetic> list = sortedCosmetics(category);
+        int pages = Math.max(1, (list.size() + MenuLayout.CONTENT_CAPACITY - 1) / MenuLayout.CONTENT_CAPACITY);
+        int page = Math.max(1, Math.min(pages, requestedPage));
+        String title = switch (category) {
+            case KILL_EFFECTS -> "Kill Effects";
+            case TRAILS -> "Projectile Trails";
+            default -> "Titles";
+        };
+        Inventory inv = frame(player, Menu.COSMETIC_LIST, "Cosmetics ▸ " + title + (pages > 1 ? " (" + page + "/" + pages + ")" : ""), null);
         PlayerData data = data(player);
-        for (int i = 0; i < TAG_SLOTS.size() && offset + i < tags.size(); i++) {
-            NamedCosmetic tag = tags.get(offset + i);
-            boolean selected = tag.id.equals(data.selectedTag);
-            boolean owned = has(player, Category.TAGS, tag.id);
-            inv.setItem(TAG_SLOTS.get(i), item(Material.NAME_TAG, tag.display + (selected ? "&aSelected" : owned ? "&7Prefix Tag" : "&cLocked"),
-                owned ? "&aUnlocked." : "&cLocked.",
-                owned ? "&7Click to preview and equip." : "&7Requires civ.cosmetic.tags." + tag.id));
+        int offset = (page - 1) * MenuLayout.CONTENT_CAPACITY;
+        List<NamedCosmetic> shown = list.subList(offset, Math.min(list.size(), offset + MenuLayout.CONTENT_CAPACITY));
+        List<Integer> slots = MenuLayout.symmetricSlots(shown.size(), MenuLayout.CONTENT_COLUMNS);
+        for (int i = 0; i < shown.size(); i++) {
+            NamedCosmetic cosmetic = shown.get(i);
+            button(inv, slots.get(i), cosmeticItem(player, data, category, cosmetic),
+                click -> clickCosmetic(player, category, cosmetic, click, page));
         }
-        inv.setItem(45, item(Material.ARROW, "&e< Back to Cosmetics"));
-        if (page > 1) inv.setItem(46, item(Material.ARROW, "&e< Previous Page"));
-        inv.setItem(48, data.savedCustomPrefix == null
-            ? item(Material.WRITABLE_BOOK, "&b&lCUSTOM PREFIX", "&7Create one with /settitle <text>")
-            : item(Material.NAME_TAG, data.savedCustomPrefix + "&7Saved Custom", "&7Click to equip it again."));
-        inv.setItem(49, item(Material.BARRIER, "&c&lCLEAR PERSONAL PREFIX"));
-        inv.setItem(50, item(Material.WRITABLE_BOOK, "&e&lCREATE CUSTOM", "&7Use /settitle <text>"));
-        if (offset + TAG_SLOTS.size() < tags.size()) inv.setItem(53, item(Material.ARROW, "&aNext Page >"));
+        if (category == Category.TAGS) {
+            button(inv, SLOT_LEFT_ACTION, customTitleItem(player, data), click -> clickCustomTitle(player));
+            button(inv, SLOT_RIGHT_ACTION, item(Material.GRAY_DYE, "&c&lReset Title", "&7Show only your rank tag.", "", "&eClick to reset"), click -> {
+                clearPrefix(player);
+                msg(player, "&eTitle reset. Your rank tag shows on its own.");
+                openTags(player, page);
+            });
+        } else {
+            button(inv, SLOT_LEFT_ACTION, item(Material.OAK_SIGN, "&e&lHow It Works",
+                "&eLeft-click &7an unlocked " + (category == Category.KILL_EFFECTS ? "effect" : "trail") + " to equip it.",
+                "&eRight-click &7to preview it.",
+                "&7Click your equipped one to take it off.", "",
+                "&7Locked ones show how to unlock them."), click -> { });
+            String selected = category == Category.KILL_EFFECTS ? data.selectedKillEffect : data.selectedTrail;
+            if (selected != null) {
+                button(inv, SLOT_RIGHT_ACTION, item(Material.GRAY_DYE, "&c&lUnequip", "&7Equipped: &f" + selectedName(categoryCosmetics(category), selected), "", "&eClick to unequip"),
+                    click -> {
+                        unequip(player, category);
+                        openCosmeticList(player, category, page);
+                    });
+            }
+        }
+        pageButtons(inv, page, pages, next -> openCosmeticList(player, category, next));
+        backButton(inv, "Cosmetics", () -> openHub(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
-    private void openLorePreview(Player player, String raw) {
-        Inventory inv = gui(Menu.LORE_PREVIEW, 27, "&8Item Lore > Preview", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        ItemStack preview = player.getInventory().getItemInMainHand().clone();
-        applyLoreToItem(preview, raw);
-        inv.setItem(11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lSAVE ITEM LORE", "&7Apply this name and lore.", "&7Consumes one Lore Credit."));
-        inv.setItem(13, preview);
-        inv.setItem(15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCANCEL"));
-        player.openInventory(inv);
+    private boolean isEquipped(PlayerData data, Category category, String id) {
+        return switch (category) {
+            case KILL_EFFECTS -> id.equals(data.selectedKillEffect);
+            case TRAILS -> id.equals(data.selectedTrail);
+            case TAGS -> id.equals(data.selectedTag);
+            default -> false;
+        };
     }
 
-    private void openLoreMenu(Player player) {
-        PlayerData data = data(player);
-        Inventory inv = gui(Menu.LORE_MENU, 27, "&8Item Lore", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        inv.setItem(4, item(Material.DIAMOND_SWORD, "&f&lItem Lore",
-            "&7Credits: &e" + data.loreCredits,
-            "&7Held item: &f" + heldItemName(player),
-            "",
-            has(player, Category.LORE, "item") ? "&aUnlocked." : "&cLocked."));
-        inv.setItem(10, item(Material.WRITABLE_BOOK, "&b&lCreate Custom Lore",
-            "&7Use the command:",
-            "&f/setlore <Name|Lore line 1|Lore line 2>",
-            "&f/setlore book &7for long book input",
-            "&f/setlore editor &7for the web editor",
-            "",
-            "&7A preview and confirm menu will open."));
-        inv.setItem(12, exampleLorePreset());
-        inv.setItem(14, item(Material.BOOK, "&e&lLore History", "&7View your previous lore previews.", "", "&eClick to open."));
-        inv.setItem(16, item(Material.BARRIER, "&c&lClear Held Item Lore", "&7Remove custom name and lore from", "&7the item in your main hand.", "", "&eClick to preview."));
-        inv.setItem(22, item(Material.ARROW, "&e< Back to Cosmetics"));
-        player.openInventory(inv);
+    private ItemStack cosmeticItem(Player player, PlayerData data, Category category, NamedCosmetic cosmetic) {
+        boolean owned = has(player, category, cosmetic.id());
+        boolean equipped = owned && isEquipped(data, category, cosmetic.id());
+        List<String> lore = new ArrayList<>();
+        lore.add(cosmetic.founder() ? "&6✪ Founder Exclusive" : cosmetic.rarity().color + "● " + cosmetic.rarity().label);
+        if (category == Category.TAGS) lore.add("&7Preview: &r" + cosmetic.display() + "&f" + player.getName());
+        lore.add("");
+        if (equipped) {
+            lore.add("&a✔ Equipped");
+            lore.add("");
+            lore.add("&eClick &7to unequip");
+            if (category != Category.TAGS) lore.add("&eRight-click &7to preview");
+        } else if (owned) {
+            lore.add("&a✔ Unlocked");
+            lore.add("");
+            lore.add("&eClick &7to equip");
+            if (category != Category.TAGS) lore.add("&eRight-click &7to preview");
+        } else {
+            lore.add("&c✖ Locked");
+            if (cosmetic.founder()) {
+                lore.add("&7Exclusive to &6Founders&7.");
+            } else {
+                Rarity rarity = cosmetic.rarity();
+                lore.add("&7Included with the " + rarityRanks.get(rarity) + " &7rank,");
+                lore.add("&7or one " + rarity.display() + " Token&7.");
+                lore.add("");
+                int tokens = data.tokens(rarity);
+                if (tokens > 0) {
+                    lore.add("&eClick &7to redeem a token &8(&f" + tokens + " &8left)");
+                } else {
+                    lore.add("&b" + storeHost());
+                }
+            }
+        }
+        return glow(item(cosmetic.icon(), cosmetic.display(), lore.toArray(String[]::new)), equipped);
     }
 
-    private void openLoreClearConfirm(Player player) {
-        if (!has(player, Category.LORE, "item")) {
-            msg(player, "&cYou do not have access to custom item lore.");
+    private void clickCosmetic(Player player, Category category, NamedCosmetic cosmetic, ClickType click, int page) {
+        if (!has(player, category, cosmetic.id())) {
+            if (!cosmetic.founder() && data(player).tokens(cosmetic.rarity()) > 0) {
+                openRedeemConfirm(player, category, cosmetic, page);
+            } else if (cosmetic.founder()) {
+                deny(player, "&cThat cosmetic is exclusive to Founders.");
+            } else {
+                deny(player, "&cLocked. Get the " + rarityRanks.get(cosmetic.rarity()) + " &crank or a "
+                    + cosmetic.rarity().display() + " Token &cat &b" + storeHost() + "&c.");
+            }
             return;
         }
-        ItemStack held = player.getInventory().getItemInMainHand();
-        if (held.getType().isAir()) {
-            msg(player, "&cHold an item first.");
+        if (click.isRightClick() && category != Category.TAGS) {
+            if (tryPreview(player)) {
+                player.closeInventory();
+                if (category == Category.KILL_EFFECTS) playKillEffect(cosmetic.id(), player.getLocation().add(0, 1, 0), player, true);
+                else previewTrail(player, cosmetic.id());
+            }
             return;
         }
-        Inventory inv = gui(Menu.LORE_CLEAR_CONFIRM, 27, "&8Clear Lore > Confirm", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        ItemStack preview = held.clone();
-        clearLoreFromItem(preview);
-        inv.setItem(11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lCONFIRM CLEAR", "&7Remove custom name and lore.", "&7Other item data stays unchanged."));
-        inv.setItem(13, preview);
-        inv.setItem(15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCANCEL"));
+        PlayerData data = data(player);
+        if (isEquipped(data, category, cosmetic.id())) {
+            unequip(player, category);
+        } else {
+            switch (category) {
+                case KILL_EFFECTS -> data.selectedKillEffect = cosmetic.id();
+                case TRAILS -> data.selectedTrail = cosmetic.id();
+                case TAGS -> {
+                    data.selectedTag = cosmetic.id();
+                    data.customPrefix = null;
+                }
+                default -> {
+                    return;
+                }
+            }
+            save(data);
+            if (category == Category.TAGS) applyPrefix(player);
+            msg(player, "&aEquipped " + cosmetic.display() + "&a.");
+            player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, .6f, 1.4f);
+        }
+        openCosmeticList(player, category, page);
+    }
+
+    private void unequip(Player player, Category category) {
+        PlayerData data = data(player);
+        switch (category) {
+            case KILL_EFFECTS -> data.selectedKillEffect = null;
+            case TRAILS -> data.selectedTrail = null;
+            case TAGS -> {
+                clearPrefix(player);
+                msg(player, "&eTitle removed.");
+                return;
+            }
+            default -> {
+                return;
+            }
+        }
+        save(data);
+        msg(player, "&eUnequipped.");
+    }
+
+    private ItemStack customTitleItem(Player player, PlayerData data) {
+        if (!has(player, Category.TITLE, "all")) {
+            return item(Material.WRITABLE_BOOK, "&b&lCustom Title", "&7Write your own title.", "",
+                "&c✖ Locked", "&7Included with the " + perkRank("title", "&bDiamond") + " &7rank.");
+        }
+        if (data.savedCustomPrefix != null) {
+            boolean equipped = data.savedCustomPrefix.equals(data.customPrefix);
+            return glow(item(Material.NAME_TAG, "&b&lCustom Title",
+                "&7Saved: &r" + data.savedCustomPrefix + "&f" + player.getName(), "",
+                equipped ? "&a✔ Equipped" : "&eClick &7to equip",
+                "&7Change it with &f/settitle <text>"), equipped);
+        }
+        return item(Material.WRITABLE_BOOK, "&b&lCustom Title", "&7Write your own title with",
+            "&f/settitle <text>", "", "&7Up to " + prefixMaxLength + " characters.", "", "&eClick for instructions");
+    }
+
+    private void clickCustomTitle(Player player) {
+        PlayerData data = data(player);
+        if (!has(player, Category.TITLE, "all")) {
+            deny(player, "&cCustom titles are included with the " + perkRank("title", "&bDiamond") + " &crank.");
+        } else if (data.savedCustomPrefix == null) {
+            player.closeInventory();
+            msg(player, "&eWrite your title with &b/settitle <text>&e. You'll see a preview first.");
+        } else {
+            data.customPrefix = data.savedCustomPrefix;
+            data.selectedTag = null;
+            save(data);
+            applyPrefix(player);
+            msg(player, "&aEquipped your custom title: &r" + data.savedCustomPrefix);
+            openTags(player, 1);
+        }
+    }
+
+    // --- Tokens ---
+
+    private void openTokens(Player player) {
+        PlayerData data = data(player);
+        Inventory inv = frame(player, Menu.TOKENS, "Cosmetics ▸ Tokens", null);
+        List<Integer> slots = List.of(MenuLayout.contentSlot(1, 1), MenuLayout.contentSlot(1, 2), MenuLayout.contentSlot(1, 4), MenuLayout.contentSlot(1, 5));
+        Rarity[] rarities = Rarity.values();
+        for (int i = 0; i < rarities.length; i++) {
+            Rarity rarity = rarities[i];
+            int count = data.tokens(rarity);
+            ItemStack token = glow(item(rarity.tokenIcon, rarity.color + "&l" + rarity.label + " Token",
+                "&7You have: &f" + count, "",
+                "&7Unlocks any one " + rarity.display() + " &7cosmetic.",
+                "&7Open a category and click a locked",
+                rarity.display() + " &7cosmetic to redeem it.", "",
+                "&8Founder cosmetics can't be redeemed."), count > 0);
+            token.setAmount(Math.max(1, Math.min(64, count)));
+            inv.setItem(slots.get(i), token);
+        }
+        button(inv, MenuLayout.contentSlot(2, 3), item(Material.WRITABLE_BOOK, "&e&lLore Credits",
+            "&7You have: &f" + data.loreCredits, "",
+            "&7Each credit renames one item", "&7and gives it custom lore.", "",
+            "&eClick to open Item Lore"), click -> openLoreMenu(player));
+        backButton(inv, "Cosmetics", () -> openHub(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
-    private void openPrefixPreview(Player player, String clean) {
-        Inventory inv = gui(Menu.PREFIX_PREVIEW, 27, "&8Custom Prefix > Preview", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
-        inv.setItem(11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lSAVE AND EQUIP", "&7Save this custom prefix."));
-        inv.setItem(13, item(Material.NAME_TAG, clean + "&7Preview", "&7Name preview:", "&f" + clean + "&f" + player.getName(), "", "&7Chat preview:", clean + "&f" + player.getName() + "&7: Hello!", "", "&8Raw: &7" + clean));
-        inv.setItem(15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCANCEL"));
+    private void openRedeemConfirm(Player player, Category category, NamedCosmetic cosmetic, int page) {
+        Rarity rarity = cosmetic.rarity();
+        int have = data(player).tokens(rarity);
+        Inventory inv = dialog(Menu.REDEEM_CONFIRM, "Confirm ▸ Redeem Token");
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lRedeem",
+            "&7Spend &f1 " + rarity.display() + " Token &7to unlock",
+            cosmetic.display() + " &7forever.", "",
+            "&7Tokens left afterwards: &f" + Math.max(0, have - 1)), click -> redeemToken(player, category, cosmetic, page));
+        inv.setItem(13, item(cosmetic.icon(), cosmetic.display(), rarity.color + "● " + rarity.label, "", "&7" + categoryLabel(category)));
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCancel", "&7Go back without spending."),
+            click -> openCosmeticList(player, category, page));
+        player.openInventory(inv);
+    }
+
+    private void redeemToken(Player player, Category category, NamedCosmetic cosmetic, int page) {
+        UUID uuid = player.getUniqueId();
+        player.closeInventory();
+        runStorage("redeem a token", uuid, () -> storage.redeemToken(uuid, cosmetic.rarity(), category, cosmetic.id()), outcome -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online == null) return;
+            switch (outcome) {
+                case REDEEMED -> {
+                    msg(online, "&aUnlocked " + cosmetic.display() + " &awith a " + cosmetic.rarity().display() + " Token&a!");
+                    online.playSound(online.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, .6f, 1.2f);
+                }
+                case ALREADY_OWNED -> msg(online, "&eYou already own that cosmetic. No token was spent.");
+                case NO_TOKEN -> deny(online, "&cYou have no " + cosmetic.rarity().display() + " Tokens &cleft.");
+            }
+            refreshEntitlements(uuid, () -> {
+                Player refreshed = Bukkit.getPlayer(uuid);
+                if (refreshed != null) openCosmeticList(refreshed, category, page);
+            });
+        }, () -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) deny(online, "&cCouldn't redeem right now, and no token was spent. Try again in a moment.");
+        });
+    }
+
+    // --- Kill messages ---
+
+    private void openKillMessages(Player player) {
+        PlayerData data = data(player);
+        boolean unlocked = has(player, Category.KILLMSG, "all");
+        Inventory inv = frame(player, Menu.KILL_MESSAGES, "Cosmetics ▸ Kill Messages", null);
+        String current = data.killMessage == null ? "&7Default death message"
+            : "&r" + LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(normalizeKillMessage(data.killMessage),
+                component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())));
+        inv.setItem(MenuLayout.contentSlot(0, 3), item(Material.PAPER, "&6&lYour Kill Message", "&7Equipped: &f" + currentKillMessageText(data), current));
+        List<Integer> slots = MenuLayout.spacedSlots(killMessagePresets.size());
+        for (int i = 0; i < killMessagePresets.size() && i < slots.size(); i++) {
+            KillMessagePreset preset = killMessagePresets.get(i);
+            boolean equipped = preset.message.equals(data.killMessage);
+            String preview = LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(preset.message,
+                component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())));
+            List<String> lore = new ArrayList<>(List.of("&7Preview:", "&r" + preview, ""));
+            if (!unlocked) {
+                lore.add("&c✖ Locked");
+                lore.add("&7Included with the " + perkRank("killmsg", "&dNetherite") + " &7rank.");
+            } else {
+                lore.add(equipped ? "&a✔ Equipped" : "&eClick &7to preview and equip");
+            }
+            button(inv, slots.get(i), glow(item(preset.icon, preset.display, lore.toArray(String[]::new)), equipped), click -> {
+                if (!has(player, Category.KILLMSG, "all")) {
+                    deny(player, "&cKill messages are included with the " + perkRank("killmsg", "&dNetherite") + " &crank.");
+                    return;
+                }
+                data(player).pendingKillMessage = preset.message;
+                save(data(player));
+                openKillMessagePreview(player, preset.message);
+            });
+        }
+        button(inv, SLOT_LEFT_ACTION, item(Material.WRITABLE_BOOK, "&b&lWrite Your Own",
+            unlocked ? "&7Use &f/setkillmsg <message>" : "&c✖ Locked",
+            unlocked ? "&7Placeholders: &f{killer} {victim} {item}" : "&7Included with the " + perkRank("killmsg", "&dNetherite") + " &7rank."),
+            click -> {
+                if (!has(player, Category.KILLMSG, "all")) {
+                    deny(player, "&cKill messages are included with the " + perkRank("killmsg", "&dNetherite") + " &crank.");
+                    return;
+                }
+                player.closeInventory();
+                msg(player, "&eWrite one with &b/setkillmsg <message>&e. Use &f{killer}&e, &f{victim} &eand &f{item}&e.");
+            });
+        if (data.killMessage != null) {
+            button(inv, SLOT_RIGHT_ACTION, item(Material.GRAY_DYE, "&c&lReset", "&7Go back to the default", "&7death message."), click -> {
+                clearKillMessage(player);
+                openKillMessages(player);
+            });
+        }
+        backButton(inv, "Cosmetics", () -> openHub(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
     private void openKillMessagePreview(Player player, String raw) {
         raw = normalizeKillMessage(raw);
-        Inventory inv = gui(Menu.KILLMSG_PREVIEW, 27, "&8Kill Message > Preview", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
+        Inventory inv = dialog(Menu.KILLMSG_PREVIEW, "Confirm ▸ Kill Message");
         String preview = LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(raw, component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())));
-        inv.setItem(11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lSAVE KILL MESSAGE", "&7Use this kill message."));
-        inv.setItem(13, item(Material.PAPER, "&e&lPREVIEW", "&7Final broadcast ending:", "&r" + preview, "", "&8Raw: &7" + raw, "&8Placeholders: {killer}, {victim}, {item}"));
-        inv.setItem(15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCANCEL"));
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lSave", "&7Use this kill message."), click -> {
+            PlayerData data = data(player);
+            if (data.pendingKillMessage == null) {
+                msg(player, "&cThat preview expired. Try /setkillmsg <message> again.");
+            } else {
+                data.killMessage = data.pendingKillMessage;
+                data.pendingKillMessage = null;
+                save(data);
+                msg(player, "&aKill message saved.");
+                player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, .6f, 1.4f);
+            }
+            openKillMessages(player);
+        });
+        inv.setItem(13, item(Material.PAPER, "&6&lPreview", "&7How it will look in chat:", "&r" + preview, "", "&8Raw: &7" + raw));
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCancel"), click -> {
+            data(player).pendingKillMessage = null;
+            save(data(player));
+            openKillMessages(player);
+        });
         player.openInventory(inv);
     }
 
-    private void openKillMessages(Player player) {
-        Inventory inv = gui(Menu.KILL_MESSAGES, 45, "&8Kill Messages", null);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
+    // --- Custom title preview ---
+
+    private void openPrefixPreview(Player player, String clean) {
+        Inventory inv = dialog(Menu.PREFIX_PREVIEW, "Confirm ▸ Custom Title");
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lSave and Equip", "&7Save this as your custom title."), click -> {
+            String pending = pendingPrefix.remove(player.getUniqueId());
+            if (pending == null) {
+                msg(player, "&cThat preview expired. Try /settitle <text> again.");
+                player.closeInventory();
+                return;
+            }
+            PlayerData data = data(player);
+            data.customPrefix = pending;
+            data.savedCustomPrefix = pending;
+            data.selectedTag = null;
+            save(data);
+            applyPrefix(player);
+            msg(player, "&aSaved and equipped your custom title: &r" + pending);
+            player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, .6f, 1.4f);
+            openTags(player, 1);
+        });
+        inv.setItem(13, item(Material.NAME_TAG, "&b&lPreview", "&7Name: &r" + clean + "&f" + player.getName(), "",
+            "&7Chat: &r" + clean + "&f" + player.getName() + "&7: Hello!"));
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCancel"), click -> {
+            pendingPrefix.remove(player.getUniqueId());
+            player.closeInventory();
+            msg(player, "&eCustom title cancelled.");
+        });
+        player.openInventory(inv);
+    }
+
+    // --- Item lore ---
+
+    private void openLoreMenu(Player player) {
         PlayerData data = data(player);
-        inv.setItem(4, item(Material.PAPER, "&c&lSelected Kill Message",
-            "&7Current: &f" + currentKillMessageText(data),
-            "",
-            data.killMessage == null ? "&7Default Paper death message is active." : "&7Your selected message appears below.",
-            data.killMessage == null ? "" : "&r" + LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(normalizeKillMessage(data.killMessage), component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())))));
-        List<Integer> slots = centeredRowSlots(killMessagePresets.size(), List.of(10, 11, 12, 13, 14, 15, 16));
-        for (int i = 0; i < killMessagePresets.size() && i < slots.size(); i++) {
-            KillMessagePreset preset = killMessagePresets.get(i);
-            boolean selected = preset.message.equals(data.killMessage);
-            String preview = LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(preset.message, component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())));
-            inv.setItem(slots.get(i), item(selected ? Material.LIME_DYE : preset.icon, preset.display + (selected ? " &7(&aSelected&7)" : ""),
-                has(player, Category.KILLMSG, "all") ? "&aUnlocked." : "&cLocked.",
-                "&7Preview:",
-                "&r" + preview,
-                "",
-                "&eClick to preview and select."));
-        }
-        if (data.killMessage != null) {
-            String preview = LegacyComponentSerializer.legacySection().serialize(renderKillMessageComponent(normalizeKillMessage(data.killMessage), component(player.getName()), component("ExampleVictim"), hoverItemText(exampleLorePreset())));
-            inv.setItem(22, item(Material.WRITABLE_BOOK, "&b&lCurrent Custom", "&7Preview:", "&r" + preview, "", "&8Raw: &7" + data.killMessage));
-        } else {
-            inv.setItem(22, item(Material.WRITABLE_BOOK, "&b&lCustom Message", "&7Create one with:", "&f/setkillmsg <message>", "", "&8Use {killer}, {victim}, {item}"));
-        }
-        inv.setItem(36, item(Material.ARROW, "&e< Back to Cosmetics"));
-        inv.setItem(40, item(Material.BARRIER, "&c&lCLEAR KILL MESSAGE"));
-        inv.setItem(44, item(Material.OAK_SIGN, "&e&lCUSTOM COMMAND", "&7Use:", "&f/setkillmsg <message>", "", "&8Placeholders: {killer}, {victim}, {item}"));
+        Inventory inv = frame(player, Menu.LORE_MENU, "Cosmetics ▸ Item Lore", null);
+        ItemStack held = player.getInventory().getItemInMainHand();
+        ItemStack heldIcon = held.getType().isAir() ? new ItemStack(Material.BARRIER) : new ItemStack(held.getType());
+        ItemMeta heldMeta = heldIcon.getItemMeta();
+        heldMeta.displayName(component("&f&lHeld Item: &r" + heldItemName(player)));
+        heldMeta.lore(List.of(component("&7Lore Credits: &e" + data.loreCredits), Component.empty(),
+            component(data.loreCredits > 0 || player.isOp() ? "&7Each change uses one credit." : "&cYou have no Lore Credits.")));
+        heldIcon.setItemMeta(heldMeta);
+        inv.setItem(MenuLayout.contentSlot(0, 3), heldIcon);
+        button(inv, MenuLayout.contentSlot(1, 1), item(Material.WRITABLE_BOOK, "&b&lWrite Lore",
+            "&f/setlore <Name|Line 1|Line 2>", "&f/setlore book &7reads your offhand book", "&f/setlore draft &7builds it line by line", "",
+            "&7You'll see a preview first.", "", "&eClick for instructions"), click -> {
+            player.closeInventory();
+            msg(player, "&eShort lore: &f/setlore <Name|Lore line 1|Lore line 2>");
+            msg(player, "&eLong lore: &f/setlore book &7or &f/setlore draft start <name>");
+        });
+        button(inv, MenuLayout.contentSlot(1, 3), item(Material.FILLED_MAP, "&b&lWeb Editor", "&7Design lore in your browser.", "", "&eClick for the link"), click -> {
+            player.closeInventory();
+            sendLoreEditor(player);
+        });
+        button(inv, MenuLayout.contentSlot(1, 5), exampleLorePreset(), click -> applyExampleLorePreset(player));
+        button(inv, MenuLayout.contentSlot(2, 2), item(Material.BOOK, "&e&lLore History", "&7Your recent lore designs.", "", "&eClick to open"),
+            click -> openLoreHistory(player));
+        button(inv, MenuLayout.contentSlot(2, 4), item(Material.GRINDSTONE, "&c&lClear Held Item", "&7Remove the custom name and lore", "&7from the item in your hand.", "", "&eClick to preview"),
+            click -> openLoreClearConfirm(player));
+        backButton(inv, "Cosmetics", () -> openHub(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
     private void openLoreHistory(Player player) {
-        Inventory inv = gui(Menu.LORE_HISTORY, 36, "&8Lore History > Preview", null);
-        fill(inv, Material.GRAY_STAINED_GLASS_PANE);
-        int slot = 0;
-        for (ItemStack item : data(player).loreHistory) {
-            inv.setItem(slot++, item);
-            if (slot > 26) break;
+        Inventory inv = frame(player, Menu.LORE_HISTORY, "Item Lore ▸ History", null);
+        List<ItemStack> history = data(player).loreHistory;
+        List<Integer> slots = MenuLayout.symmetricSlots(Math.min(history.size(), MenuLayout.CONTENT_CAPACITY), MenuLayout.CONTENT_COLUMNS);
+        for (int i = 0; i < slots.size(); i++) inv.setItem(slots.get(i), history.get(i));
+        if (history.isEmpty()) {
+            inv.setItem(MenuLayout.contentSlot(1, 3), item(Material.PAPER, "&7No lore yet", "&7Items you customize appear here."));
         }
-        inv.setItem(27, exampleLorePreset());
-        inv.setItem(31, item(Material.ARROW, "&e< Back to Lore Menu"));
-        inv.setItem(35, item(Material.BARRIER, "&c&lCLEAR HISTORY", "&7Clears saved lore preview items.", "&7Does not edit your held item."));
+        inv.setItem(SLOT_LEFT_ACTION, item(Material.OAK_SIGN, "&e&lHistory", "&7Your last " + MenuLayout.CONTENT_CAPACITY + " lore designs.", "&7Hover one to read it."));
+        button(inv, SLOT_RIGHT_ACTION, item(Material.GRAY_DYE, "&c&lClear History", "&7Removes this list.", "&7Your items are not changed."),
+            click -> clearLoreHistory(player));
+        backButton(inv, "Item Lore", () -> openLoreMenu(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
+    private void openLorePreview(Player player, String raw) {
+        Inventory inv = dialog(Menu.LORE_PREVIEW, "Confirm ▸ Item Lore");
+        ItemStack preview = player.getInventory().getItemInMainHand().clone();
+        applyLoreToItem(preview, raw);
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lApply", "&7Apply this name and lore.", "&7Uses one Lore Credit."), click -> {
+            String pending = pendingLore.remove(player.getUniqueId());
+            if (pending == null) msg(player, "&cThat preview expired. Try /setlore again.");
+            else applyLore(player, pending);
+            player.closeInventory();
+        });
+        inv.setItem(13, preview);
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCancel"), click -> {
+            pendingLore.remove(player.getUniqueId());
+            player.closeInventory();
+            msg(player, "&eItem lore cancelled. No credit was used.");
+        });
+        player.openInventory(inv);
+    }
+
+    private void openLoreClearConfirm(Player player) {
+        ItemStack held = player.getInventory().getItemInMainHand();
+        if (held.getType().isAir()) {
+            deny(player, "&cHold the item you want to clear first.");
+            return;
+        }
+        Inventory inv = dialog(Menu.LORE_CLEAR_CONFIRM, "Confirm ▸ Clear Lore");
+        ItemStack preview = held.clone();
+        clearLoreFromItem(preview);
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lClear", "&7Remove the custom name and lore.", "&7Other item data stays the same."), click -> {
+            ItemStack current = player.getInventory().getItemInMainHand();
+            if (current.getType().isAir()) {
+                msg(player, "&cHold an item first.");
+            } else {
+                clearLoreFromItem(current);
+                msg(player, "&eCleared the custom name and lore from your held item.");
+                player.playSound(player.getLocation(), Sound.UI_CARTOGRAPHY_TABLE_TAKE_RESULT, 1f, 1f);
+            }
+            player.closeInventory();
+        });
+        inv.setItem(13, preview);
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCancel"), click -> openLoreMenu(player));
+        player.openInventory(inv);
+    }
+
+    // --- Armor trims ---
+
     private void openTrimPatterns(Player player) {
         if (!has(player, Category.TRIM, "all")) {
-            msg(player, "&cYou do not have access to armor trims.");
+            deny(player, "&cArmor trims are included with the " + perkRank("trim", "&bDiamond") + " &crank.");
             return;
         }
         if (!isArmor(player.getInventory().getItemInMainHand())) {
-            msg(player, "&cYou must be holding a piece of armor.");
+            deny(player, "&cHold the armor piece you want to trim, then try again.");
             return;
         }
         if (!player.isOp()) {
             long elapsed = System.currentTimeMillis() - data(player).lastTrim;
             long cooldown = trimCooldownHours * 60L * 60L * 1000L;
             if (elapsed < cooldown) {
-                msg(player, "&cCooldown: Wait " + formatDuration(cooldown - elapsed) + ".");
+                deny(player, "&cYou can trim again in " + formatDuration(cooldown - elapsed) + ".");
                 return;
             }
         }
-        Inventory inv = gui(Menu.TRIM_PATTERNS, 45, "&8Cosmetic > Select Pattern", null);
-        fill(inv, Material.GRAY_STAINED_GLASS_PANE);
-        for (int i = 0; i < trimPatterns.size(); i++) {
-            inv.setItem(TRIM_PATTERN_SLOTS.get(i), item(Material.COAST_ARMOR_TRIM_SMITHING_TEMPLATE, "&6&l" + trimPatterns.get(i) + " &ePattern", "&7Click to select this design."));
+        Inventory inv = frame(player, Menu.TRIM_PATTERNS, "Armor Trims ▸ Pattern", null);
+        List<Integer> slots = MenuLayout.symmetricSlots(trimPatterns.size(), MenuLayout.CONTENT_COLUMNS);
+        for (int i = 0; i < trimPatterns.size() && i < slots.size(); i++) {
+            String pattern = trimPatterns.get(i);
+            button(inv, slots.get(i), item(trimTemplate(pattern), "&6&l" + titleCase(pattern), "&7Click to choose a material."),
+                click -> openTrimMaterials(player, pattern));
         }
-        inv.setItem(40, item(Material.BARRIER, "&c&lRESET TRIM", "&7Click to remove existing trim."));
+        button(inv, SLOT_LEFT_ACTION, item(Material.GRINDSTONE, "&c&lRemove Trim", "&7Remove the trim from the", "&7armor in your hand."), click -> {
+            ItemStack held = player.getInventory().getItemInMainHand();
+            if (!isArmor(held)) {
+                deny(player, "&cHold the armor piece you want to reset.");
+                return;
+            }
+            removeTrim(held);
+            msg(player, "&eArmor trim removed.");
+            player.closeInventory();
+        });
+        ItemStack held = player.getInventory().getItemInMainHand().clone();
+        inv.setItem(SLOT_RIGHT_ACTION, held);
+        backButton(inv, "Cosmetics", () -> openHub(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
+    private Material trimTemplate(String pattern) {
+        Material template = Material.matchMaterial(pattern.toUpperCase(Locale.ROOT) + "_ARMOR_TRIM_SMITHING_TEMPLATE");
+        return template == null ? Material.COAST_ARMOR_TRIM_SMITHING_TEMPLATE : template;
+    }
+
     private void openTrimMaterials(Player player, String pattern) {
-        Inventory inv = gui(Menu.TRIM_MATERIALS, 36, "&8Material > " + pattern, pattern);
-        fill(inv, Material.GRAY_STAINED_GLASS_PANE);
-        for (int i = 0; i < trimMaterials.size(); i++) {
+        Inventory inv = frame(player, Menu.TRIM_MATERIALS, "Armor Trims ▸ " + titleCase(pattern), null);
+        List<Integer> slots = MenuLayout.symmetricSlots(trimMaterials.size(), 5);
+        for (int i = 0; i < trimMaterials.size() && i < slots.size(); i++) {
             String material = trimMaterials.get(i);
-            inv.setItem(TRIM_MATERIAL_SLOTS.get(i), item(trimMaterialIcon(material), "&e&l" + material + " &7Material", "&7Apply to pattern: &e" + pattern));
+            button(inv, slots.get(i), item(trimMaterialIcon(material), "&e&l" + titleCase(material), "&7Pattern: &6" + titleCase(pattern), "", "&eClick to preview"),
+                click -> openTrimConfirm(player, pattern, material));
         }
-        inv.setItem(31, item(Material.ARROW, "&e< Back to Patterns"));
+        backButton(inv, "Patterns", () -> openTrimPatterns(player));
+        storeButton(inv, player);
         player.openInventory(inv);
     }
 
     private void openTrimConfirm(Player player, String pattern, String material) {
-        Inventory inv = gui(Menu.TRIM_CONFIRM, 27, "&8Confirming Selection", pattern + "|" + material);
-        fill(inv, Material.BLACK_STAINED_GLASS_PANE);
+        Inventory inv = dialog(Menu.TRIM_CONFIRM, "Confirm ▸ Armor Trim");
         ItemStack preview = player.getInventory().getItemInMainHand().clone();
         applyTrim(preview, pattern, material);
         ItemMeta meta = preview.getItemMeta();
-        meta.lore(List.of(component("&8&m-----------------"), component("&7Pattern: &6" + pattern), component("&7Material: &f" + material), component("&8&m-----------------"), Component.empty(), component("&a&lCLICK TO APPLY")));
+        meta.lore(List.of(component("&7Pattern: &6" + titleCase(pattern)), component("&7Material: &f" + titleCase(material))));
         preview.setItemMeta(meta);
-        inv.setItem(11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lCONFIRM APPLICATION"));
+        button(inv, 11, item(Material.LIME_STAINED_GLASS_PANE, "&a&lApply Trim", "&7Next trim available in " + trimCooldownHours + "h."), click -> {
+            ItemStack item = player.getInventory().getItemInMainHand();
+            if (!isArmor(item)) {
+                deny(player, "&cYou must still be holding the armor piece.");
+                player.closeInventory();
+                return;
+            }
+            applyTrim(item, pattern, material);
+            data(player).lastTrim = System.currentTimeMillis();
+            save(data(player));
+            msg(player, "&aYour armor has been trimmed.");
+            player.playSound(player.getLocation(), Sound.BLOCK_SMITHING_TABLE_USE, 1f, 1f);
+            player.closeInventory();
+        });
         inv.setItem(13, preview);
-        inv.setItem(15, item(Material.RED_STAINED_GLASS_PANE, "&c&lCANCEL / BACK"));
+        button(inv, 15, item(Material.RED_STAINED_GLASS_PANE, "&c&lBack", "&7Pick a different material."), click -> openTrimMaterials(player, pattern));
         player.openInventory(inv);
     }
 
@@ -1534,7 +2321,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         for (int i = 0; i < categories.size() && i < ADMIN_CATEGORY_SLOTS.size(); i++) {
             inv.setItem(ADMIN_CATEGORY_SLOTS.get(i), categoryItem(targetData, categories.get(i)));
         }
-        inv.setItem(31, item(Material.GOLD_INGOT, "&6Patreon Presets",
+        inv.setItem(31, item(Material.GOLD_INGOT, "&6Supporter Presets",
             "&7Apply supporter packages from config.",
             "&7Best for 10-20 patrons.",
             "",
@@ -1651,29 +2438,21 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         int slot = event.getRawSlot();
         ItemStack clicked = event.getCurrentItem();
         if (clicked == null || clicked.getType().isAir() || clicked.getType() == Material.BLACK_STAINED_GLASS_PANE || clicked.getType() == Material.GRAY_STAINED_GLASS_PANE) return;
-        switch (holder.menu) {
-            case HUB -> clickHub(player, slot);
-            case KILL_EFFECTS -> clickKillEffects(player, slot, event.getClick());
-            case TRAILS -> clickTrails(player, slot, event.getClick());
-            case TAGS -> clickTags(player, slot, holder);
-            case PREFIX_PREVIEW -> clickPrefixPreview(player, slot);
-            case LORE_MENU -> clickLoreMenu(player, slot);
-            case LORE_PREVIEW -> clickLorePreview(player, slot);
-            case LORE_CLEAR_CONFIRM -> clickLoreClearConfirm(player, slot);
-            case KILL_MESSAGES -> clickKillMessages(player, slot);
-            case KILLMSG_PREVIEW -> clickKillMessagePreview(player, slot);
-            case LORE_HISTORY -> {
-                if (slot == 27) applyExampleLorePreset(player);
-                else if (slot == 31) openLoreMenu(player);
-                else if (slot == 35) clearLoreHistory(player);
+        if (!holder.menu.admin) {
+            Consumer<ClickType> action = holder.actions.get(slot);
+            if (action != null) {
+                player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, .35f, 1f);
+                action.accept(event.getClick());
             }
-            case TRIM_PATTERNS -> clickTrimPatterns(player, slot, clicked);
-            case TRIM_MATERIALS -> clickTrimMaterials(player, slot, clicked, holder);
-            case TRIM_CONFIRM -> clickTrimConfirm(player, slot, holder);
+            return;
+        }
+        switch (holder.menu) {
             case ADMIN_PLAYERS -> clickAdminPlayers(player, slot, holder);
             case ADMIN_CATEGORIES -> clickAdminCategories(player, slot, event.getClick(), holder);
             case ADMIN_CATEGORY -> clickAdminCategory(player, slot, holder);
             case ADMIN_PRESETS -> clickAdminPresets(player, slot, event.getClick(), holder);
+            default -> {
+            }
         }
     }
 
@@ -1681,296 +2460,6 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     public void onInventoryDrag(InventoryDragEvent event) {
         if (event.getInventory().getHolder() instanceof GuiHolder) {
             event.setCancelled(true);
-        }
-    }
-
-    private void clickHub(Player player, int slot) {
-        if (slot == 10) openKillEffects(player);
-        else if (slot == 11) openTrimPatterns(player);
-        else if (slot == 12) openTags(player, 1);
-        else if (slot == 13) openLoreMenu(player);
-        else if (slot == 14) openTrails(player);
-        else if (slot == 15) openKillMessages(player);
-        else if (slot == 16) {
-            player.closeInventory();
-            msg(player, " ");
-            msg(player, "&a&lSTORE: &b&n" + storeUrl);
-            msg(player, " ");
-        }
-    }
-
-    private void clickKillEffects(Player player, int slot, ClickType click) {
-        if (slot == 49) {
-            data(player).selectedKillEffect = null;
-            save(data(player));
-            player.closeInventory();
-            msg(player, "&cKill effect cleared.");
-            return;
-        }
-        int index = EFFECT_SLOTS.indexOf(slot);
-        if (index < 0 || index >= killEffects.size()) return;
-        NamedCosmetic effect = killEffects.get(index);
-        if (!has(player, Category.KILL_EFFECTS, effect.id)) {
-            msg(player, "&cYou do not own this kill effect.");
-            player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
-            return;
-        }
-        if (click.isRightClick()) {
-            if (tryPreview(player)) {
-                playKillEffect(effect.id, player.getLocation().add(0, 1, 0), player, true);
-            }
-            return;
-        }
-        data(player).selectedKillEffect = effect.id;
-        save(data(player));
-        player.closeInventory();
-        msg(player, "&aYou selected " + effect.display + "&a.");
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1f);
-    }
-
-    private void clickTrails(Player player, int slot, ClickType click) {
-        if (slot == 31) {
-            data(player).selectedTrail = null;
-            save(data(player));
-            player.closeInventory();
-            msg(player, "&cProjectile trail cleared.");
-            return;
-        }
-        int index = TRAIL_SLOTS.indexOf(slot);
-        if (index < 0 || index >= trails.size()) return;
-        NamedCosmetic trail = trails.get(index);
-        if (!has(player, Category.TRAILS, trail.id)) {
-            msg(player, "&cYou do not own this projectile trail.");
-            player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
-            return;
-        }
-        if (click.isRightClick()) {
-            if (tryPreview(player)) {
-                previewTrail(player, trail.id);
-            }
-            return;
-        }
-        data(player).selectedTrail = trail.id;
-        save(data(player));
-        player.closeInventory();
-        msg(player, "&aYou selected the " + trail.display + "&a trail.");
-        player.playSound(player.getLocation(), Sound.ENTITY_PLAYER_LEVELUP, 1f, 1f);
-    }
-
-    private void clickTags(Player player, int slot, GuiHolder holder) {
-        int page = holder.intData();
-        if (slot == 45) openHub(player);
-        else if (slot == 46) openTags(player, page - 1);
-        else if (slot == 48) {
-            PlayerData data = data(player);
-            if (data.savedCustomPrefix == null) {
-                player.closeInventory();
-                msg(player, "&eCreate one with: &b/settitle <text>");
-            } else if (!has(player, Category.TITLE, "all")) {
-                msg(player, "&cYou do not have access to custom prefixes.");
-            } else {
-                data.customPrefix = data.savedCustomPrefix;
-                data.selectedTag = null;
-                save(data);
-                applyPrefix(player);
-                player.closeInventory();
-                msg(player, "&aEquipped saved custom prefix: &r" + data.savedCustomPrefix);
-            }
-        } else if (slot == 49) {
-            clearPrefix(player);
-            player.closeInventory();
-            msg(player, "&ePersonal prefix cleared. Your rank prefix will show again.");
-        } else if (slot == 50) {
-            player.closeInventory();
-            msg(player, "&eCreate a custom prefix with: &b/settitle <text>");
-        } else if (slot == 53) {
-            openTags(player, page + 1);
-        } else {
-            int index = TAG_SLOTS.indexOf(slot);
-            int tagIndex = (page - 1) * TAG_SLOTS.size() + index;
-            if (index < 0 || tagIndex >= tags.size()) return;
-            NamedCosmetic tag = tags.get(tagIndex);
-            if (!has(player, Category.TAGS, tag.id)) {
-                msg(player, "&cYou do not own this prefix tag.");
-                player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
-                return;
-            }
-            PlayerData data = data(player);
-            data.selectedTag = tag.id;
-            data.customPrefix = null;
-            save(data);
-            applyPrefix(player);
-            player.closeInventory();
-            msg(player, "&aEquipped prefix: &r" + tag.display);
-        }
-    }
-
-    private void clickPrefixPreview(Player player, int slot) {
-        if (slot == 11) {
-            String pending = pendingPrefix.remove(player.getUniqueId());
-            if (pending == null) {
-                msg(player, "&cThat preview expired. Try /settitle <text> again.");
-            } else {
-                PlayerData data = data(player);
-                data.customPrefix = pending;
-                data.savedCustomPrefix = pending;
-                data.selectedTag = null;
-                save(data);
-                applyPrefix(player);
-                msg(player, "&aSaved and equipped custom prefix: &r" + pending);
-            }
-            player.closeInventory();
-        } else if (slot == 15) {
-            pendingPrefix.remove(player.getUniqueId());
-            player.closeInventory();
-            msg(player, "&eCustom prefix preview cancelled.");
-        }
-    }
-
-    private void clickLoreMenu(Player player, int slot) {
-        if (slot == 10) {
-            msg(player, "&eShort lore: &f/setlore <Name|Lore line 1|Lore line 2>");
-            msg(player, "&eLong lore: &f/setlore book &7or &f/setlore draft start <name>");
-            msg(player, "&eEditor: &b" + loreEditorUrl);
-        } else if (slot == 12) {
-            applyExampleLorePreset(player);
-        } else if (slot == 14) {
-            openLoreHistory(player);
-        } else if (slot == 16) {
-            openLoreClearConfirm(player);
-        } else if (slot == 22) {
-            openHub(player);
-        }
-    }
-
-    private void clickLorePreview(Player player, int slot) {
-        if (slot == 11) {
-            String pending = pendingLore.remove(player.getUniqueId());
-            if (pending == null) {
-                msg(player, "&cThat preview expired. Try /setlore again.");
-            } else {
-                applyLore(player, pending);
-            }
-            player.closeInventory();
-        } else if (slot == 15) {
-            pendingLore.remove(player.getUniqueId());
-            player.closeInventory();
-            msg(player, "&eItem lore preview cancelled.");
-        }
-    }
-
-    private void clickLoreClearConfirm(Player player, int slot) {
-        if (slot == 11) {
-            ItemStack held = player.getInventory().getItemInMainHand();
-            if (held.getType().isAir()) {
-                msg(player, "&cHold an item first.");
-            } else {
-                clearLoreFromItem(held);
-                msg(player, "&eCleared the custom name and lore from your held item.");
-                player.playSound(player.getLocation(), Sound.UI_CARTOGRAPHY_TABLE_TAKE_RESULT, 1f, 1f);
-            }
-            player.closeInventory();
-        } else if (slot == 15) {
-            player.closeInventory();
-            msg(player, "&eItem lore clear cancelled.");
-        }
-    }
-
-
-    private void clickKillMessages(Player player, int slot) {
-        if (slot == 36) {
-            openHub(player);
-            return;
-        }
-        if (slot == 40) {
-            clearKillMessage(player);
-            player.closeInventory();
-            return;
-        }
-        List<Integer> slots = centeredRowSlots(killMessagePresets.size(), List.of(10, 11, 12, 13, 14, 15, 16));
-        for (int i = 0; i < slots.size() && i < killMessagePresets.size(); i++) {
-            if (slot != slots.get(i)) continue;
-            if (!has(player, Category.KILLMSG, "all")) {
-                msg(player, "&cYou do not have access to custom kill messages.");
-                player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
-                return;
-            }
-            KillMessagePreset preset = killMessagePresets.get(i);
-            data(player).pendingKillMessage = preset.message;
-            save(data(player));
-            openKillMessagePreview(player, preset.message);
-            return;
-        }
-    }
-
-    private void clickKillMessagePreview(Player player, int slot) {
-        PlayerData data = data(player);
-        if (slot == 11) {
-            if (data.pendingKillMessage == null) {
-                msg(player, "&cThat preview expired. Try /setkillmsg <message> again.");
-            } else {
-                data.killMessage = data.pendingKillMessage;
-                data.pendingKillMessage = null;
-                save(data);
-                msg(player, "&aKill message saved.");
-            }
-            player.closeInventory();
-        } else if (slot == 15) {
-            data.pendingKillMessage = null;
-            save(data);
-            player.closeInventory();
-            msg(player, "&eKill message preview cancelled.");
-        }
-    }
-
-    private void clickTrimPatterns(Player player, int slot, ItemStack clicked) {
-        if (slot == 40) {
-            ItemStack item = player.getInventory().getItemInMainHand();
-            if (!isArmor(item)) {
-                msg(player, "&cHold the armor piece you want to reset.");
-                player.closeInventory();
-                return;
-            }
-            removeTrim(item);
-            msg(player, "&eArmor trim removed.");
-            player.closeInventory();
-            return;
-        }
-        int index = TRIM_PATTERN_SLOTS.indexOf(slot);
-        if (index >= 0 && index < trimPatterns.size()) {
-            openTrimMaterials(player, trimPatterns.get(index));
-        }
-    }
-
-    private void clickTrimMaterials(Player player, int slot, ItemStack clicked, GuiHolder holder) {
-        if (slot == 31) {
-            openTrimPatterns(player);
-            return;
-        }
-        int index = TRIM_MATERIAL_SLOTS.indexOf(slot);
-        if (index >= 0 && index < trimMaterials.size()) {
-            openTrimConfirm(player, holder.data, trimMaterials.get(index));
-        }
-    }
-
-    private void clickTrimConfirm(Player player, int slot, GuiHolder holder) {
-        String[] parts = holder.data.split("\\|", 2);
-        if (parts.length < 2) return;
-        if (slot == 11) {
-            ItemStack item = player.getInventory().getItemInMainHand();
-            if (!isArmor(item)) {
-                msg(player, "&cYou must still be holding the armor piece.");
-                player.closeInventory();
-                return;
-            }
-            applyTrim(item, parts[0], parts[1]);
-            data(player).lastTrim = System.currentTimeMillis();
-            save(data(player));
-            msg(player, "&a&lSUCCESS! &7Your armor has been trimmed.");
-            player.playSound(player.getLocation(), Sound.BLOCK_SMITHING_TABLE_USE, 1f, 1f);
-            player.closeInventory();
-        } else if (slot == 15) {
-            openTrimMaterials(player, parts[0]);
         }
     }
 
@@ -2957,6 +3446,14 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 dust(loc, Color.fromRGB(170, 235, 255), 1.1f, 110, .9, 1.2, .9);
                 dust(loc, Color.WHITE, .8f, 70, .8, 1.4, .8);
             }
+            case "founder" -> {
+                killSound(loc, Sound.UI_TOAST_CHALLENGE_COMPLETE, .7f, 1.2f, preview);
+                ringDust(loc.clone().add(0, .15, 0), Color.fromRGB(255, 176, 0), 1.6f, 1.2, 32);
+                ringDust(loc.clone().add(0, 2.1, 0), Color.fromRGB(255, 215, 90), 1.2f, .55, 16);
+                particles(loc.clone().add(0, 1.2, 0), Particle.END_ROD, 40, .5, .8, .5, .05);
+                particles(loc.clone().add(0, 1.6, 0), Particle.TOTEM_OF_UNDYING, 90, .6, .6, .6, .25);
+                firework(loc, Color.fromRGB(255, 176, 0), preview);
+            }
             case "crown" -> {
                 killSound(loc, Sound.BLOCK_BELL_USE, .8f, 1.4f, preview);
                 killSound(loc, Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1.8f, preview);
@@ -3089,6 +3586,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 particles(loc, Particle.REVERSE_PORTAL, 1, .06, .06, .06, .02);
             }
             case "gold" -> dust(loc, Color.fromRGB(255, 190, 35), .8f, 2, .08, .08, .08);
+            case "founder" -> {
+                dust(loc, Color.fromRGB(255, 176, 0), .9f, 2, .06, .06, .06);
+                particles(loc, Particle.END_ROD, 1, .03, .03, .03, 0);
+            }
             case "frost" -> {
                 particles(loc, Particle.SNOWFLAKE, 1, .08, .08, .08, .01);
                 dust(loc, Color.fromRGB(120, 220, 255), .7f, 1, .05, .05, .05);
@@ -3147,14 +3648,26 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private boolean has(Player player, Category category, String id) {
         PlayerData data = data(player);
         String normalized = id.toLowerCase(Locale.ROOT);
-        return player.hasPermission("civ.cosmetic.admin")
-            || player.hasPermission("civ.cosmetic." + category.id)
-            || player.hasPermission("civ.cosmetic." + category.id + ".all")
-            || player.hasPermission("civ.cosmetic." + category.id + "." + normalized)
+        if (player.hasPermission("civ.cosmetic.admin")) return true;
+        NamedCosmetic cosmetic = find(categoryCosmetics(category), normalized);
+        boolean explicit = player.hasPermission("civ.cosmetic." + category.id + "." + normalized)
             || (category == Category.KILL_EFFECTS && player.hasPermission("killeffect." + normalized))
             || (category == Category.TRAILS && player.hasPermission("civ.cosmetic.trail." + normalized))
-            || data.hasGrant(category, "all")
             || data.hasGrant(category, normalized);
+        if (cosmetic != null && cosmetic.founder()) {
+            // Founder cosmetics are never part of a category-wide or rarity unlock.
+            return explicit || player.hasPermission("civ.cosmetic.founder");
+        }
+        return explicit
+            || player.hasPermission("civ.cosmetic." + category.id)
+            || player.hasPermission("civ.cosmetic." + category.id + ".all")
+            || data.hasGrant(category, "all")
+            || (cosmetic != null && player.hasPermission(cosmetic.rarity().permission()));
+    }
+
+    /** Item lore is open to anyone with lore access or a lore credit to spend. */
+    private boolean canUseLore(Player player) {
+        return player.isOp() || has(player, Category.LORE, "item") || data(player).loreCredits > 0;
     }
 
     private PlayerData data(Player player) {
@@ -3268,6 +3781,91 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             }
         }
         throw last;
+    }
+
+    /**
+     * Main thread, periodic. One indexed query per poll for all loaded online players; only players whose version
+     * changed (a purchase, refund, redemption or admin grant on any server) are reloaded.
+     */
+    private void pollEntitlements() {
+        if (shuttingDown || !storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) return;
+        Map<UUID, Long> known = new HashMap<>();
+        for (Player online : Bukkit.getOnlinePlayers()) {
+            PlayerData data = players.get(online.getUniqueId());
+            if (data != null) known.put(online.getUniqueId(), data.entitlementsVersion);
+        }
+        if (known.isEmpty() || !entitlementPollInFlight.compareAndSet(false, true)) return;
+        storageExecutor.execute(() -> {
+            try {
+                Map<UUID, Store.Entitlements> changed = new HashMap<>();
+                for (Map.Entry<UUID, Long> stored : storage.entitlementVersions(known.keySet()).entrySet()) {
+                    if (stored.getValue().longValue() != known.get(stored.getKey()).longValue()) {
+                        changed.put(stored.getKey(), storage.loadEntitlements(stored.getKey()));
+                    }
+                }
+                if (!changed.isEmpty() && isEnabled()) {
+                    Bukkit.getScheduler().runTask(this, () -> changed.forEach(this::applyEntitlements));
+                }
+            } catch (RuntimeException e) {
+                logStorageFailure("refresh store entitlements", null, e);
+            } finally {
+                entitlementPollInFlight.set(false);
+            }
+        });
+    }
+
+    private void refreshEntitlements(UUID uuid, @Nullable Runnable then) {
+        if (!players.containsKey(uuid)) {
+            if (then != null) then.run();
+            return;
+        }
+        runStorage("refresh store entitlements", uuid, () -> storage.loadEntitlements(uuid), entitlements -> {
+            applyEntitlements(uuid, entitlements);
+            if (then != null) then.run();
+        }, then);
+    }
+
+    private void applyEntitlements(UUID uuid, Store.Entitlements entitlements) {
+        PlayerData data = players.get(uuid);
+        if (data == null) return;
+        data.applyEntitlements(entitlements);
+        Player online = Bukkit.getPlayer(uuid);
+        if (online != null) {
+            validateSelections(online);
+            applyPrefix(online);
+        }
+    }
+
+    /**
+     * Runs a storage call off the main thread with retries, then hands the result back on the main thread.
+     * Callbacks are skipped once the plugin is disabled.
+     */
+    private <T> void runStorage(String action, @Nullable UUID uuid, Supplier<T> work,
+                                @Nullable Consumer<T> onSuccess, @Nullable Runnable onFailure) {
+        if (!storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) {
+            if (onFailure != null) onFailure.run();
+            return;
+        }
+        storageExecutor.execute(() -> {
+            try {
+                T result = withRetry(work);
+                if (onSuccess != null && isEnabled()) Bukkit.getScheduler().runTask(this, () -> onSuccess.accept(result));
+            } catch (RuntimeException e) {
+                logStorageFailure(action, uuid, e);
+                if (onFailure != null && isEnabled()) Bukkit.getScheduler().runTask(this, onFailure);
+            }
+        });
+    }
+
+    /** Changes lore credits through an atomic database delta and mirrors it in the cached copy. */
+    private void adjustLoreCredits(PlayerData data, int delta) {
+        if (delta == 0) return;
+        data.loreCredits = Math.max(0, data.loreCredits + delta);
+        UUID uuid = data.uuid;
+        runStorage("change lore credits", uuid, () -> storage.addLoreCredits(uuid, delta), balance -> {
+            PlayerData live = players.get(uuid);
+            if (live != null) live.loreCredits = balance;
+        }, null);
     }
 
     private boolean isLoaded(Player player) {
@@ -3522,7 +4120,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 if (entry.getKey() == Category.TAGS && id.equals("all")) data.grant(Category.TITLE, "all");
             }
         }
-        data.loreCredits += preset.loreCredits;
+        adjustLoreCredits(data, preset.loreCredits);
     }
 
     private void grantAll(PlayerData data) {
@@ -3742,7 +4340,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         String name = command.getName().toLowerCase(Locale.ROOT);
         if (name.equals("cosmetics") && args.length == 1) return List.of("help");
         if (name.equals("cosadmin")) {
-            if (args.length == 1) return List.of("grant", "revoke", "clear", "preset", "grantall", "patreon", "help");
+            if (args.length == 1) {
+                List<String> subs = new ArrayList<>(List.of("grant", "revoke", "clear", "preset", "grantall", "patreon", "ledger", "help"));
+                if (isConsole(sender)) subs.addAll(STORE_SUBCOMMANDS);
+                return subs;
+            }
+            if (args.length == 3 && args[0].equalsIgnoreCase("token")) return Arrays.stream(Rarity.values()).map(r -> r.id).toList();
             if (args.length == 3 && args[0].equalsIgnoreCase("preset")) return grantPresets.stream().map(p -> p.id).toList();
             if (args.length == 3 && args[0].equalsIgnoreCase("grantall")) return List.of("0", "1", "3", "10");
             if (args.length == 3) return adminCategories().stream().map(c -> c.id).toList();
@@ -3788,7 +4391,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         return placeholderPrefix(player) + player.getName();
     }
 
-    private record NamedCosmetic(String id, String display, Material icon) {
+    /** {@code founder} cosmetics are exclusive: category-wide unlocks, rarity permissions and tokens never include them. */
+    private record NamedCosmetic(String id, String display, Material icon, Rarity rarity, boolean founder) {
+        NamedCosmetic(String id, String display, Material icon, Rarity rarity) {
+            this(id, display, icon, rarity, false);
+        }
     }
 
     private record KillMessagePreset(String id, String display, Material icon, String message) {
@@ -3830,8 +4437,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private enum Menu {
-        HUB, KILL_EFFECTS, TRAILS, TAGS, PREFIX_PREVIEW, LORE_MENU, LORE_PREVIEW, LORE_CLEAR_CONFIRM, KILL_MESSAGES, KILLMSG_PREVIEW, LORE_HISTORY,
-        TRIM_PATTERNS, TRIM_MATERIALS, TRIM_CONFIRM,
+        HUB, COSMETIC_LIST, TOKENS, REDEEM_CONFIRM, PREFIX_PREVIEW, LORE_MENU, LORE_PREVIEW, LORE_CLEAR_CONFIRM, KILL_MESSAGES,
+        KILLMSG_PREVIEW, LORE_HISTORY, TRIM_PATTERNS, TRIM_MATERIALS, TRIM_CONFIRM,
         ADMIN_PLAYERS(true), ADMIN_CATEGORIES(true), ADMIN_CATEGORY(true), ADMIN_PRESETS(true);
 
         /** Admin menus re-check civ.cosmetic.admin on every click, not just when they are opened. */
@@ -3849,6 +4456,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private static class GuiHolder implements InventoryHolder {
         private final Menu menu;
         private final String data;
+        /** Player menus register a click action per slot; admin menus still dispatch by slot number. */
+        private final Map<Integer, Consumer<ClickType>> actions = new HashMap<>();
         private Inventory inventory;
 
         private GuiHolder(Menu menu, String data) {
@@ -3909,6 +4518,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         String pendingKillMessage;
         int loreCredits;
         long lastTrim;
+        /** Unspent store tokens per rarity. Derived from the purchase ledger; never saved from this copy. */
+        final Map<Rarity, Integer> tokens = Store.emptyTokens();
+        /** Last entitlements_version read from storage; a higher stored value means another server changed something. */
+        long entitlementsVersion;
         final List<ItemStack> loreHistory = new ArrayList<>();
 
         PlayerData(UUID uuid) {
@@ -3928,6 +4541,21 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             return grants.get(category).contains(id.toLowerCase(Locale.ROOT));
         }
 
+        int tokens(Rarity rarity) {
+            return tokens.getOrDefault(rarity, 0);
+        }
+
+        void applyEntitlements(Store.Entitlements entitlements) {
+            for (Category category : Category.values()) {
+                Set<String> current = grants.get(category);
+                current.clear();
+                current.addAll(entitlements.grants().getOrDefault(category, Set.of()));
+            }
+            loreCredits = entitlements.loreCredits();
+            tokens.putAll(entitlements.tokens());
+            entitlementsVersion = entitlements.version();
+        }
+
         PlayerData copy() {
             PlayerData copy = new PlayerData(uuid);
             for (Map.Entry<Category, Set<String>> entry : grants.entrySet()) {
@@ -3942,6 +4570,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             copy.pendingKillMessage = pendingKillMessage;
             copy.loreCredits = loreCredits;
             copy.lastTrim = lastTrim;
+            copy.tokens.putAll(tokens);
+            copy.entitlementsVersion = entitlementsVersion;
             for (ItemStack item : loreHistory) {
                 copy.loreHistory.add(item.clone());
             }

@@ -31,7 +31,7 @@ final class YamlCosmeticsImporter {
             String rawUuid = file.getName().substring(0, file.getName().length() - 4);
             try {
                 CivCosmeticsPlugin.PlayerData data = loadYaml(UUID.fromString(rawUuid), file);
-                storage.save(data);
+                storage.importLegacy(data);
                 imported++;
             } catch (IllegalArgumentException e) {
                 logger.warning("Skipping invalid CivCosmetics player file " + file.getName());

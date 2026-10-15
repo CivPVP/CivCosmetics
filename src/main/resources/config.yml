@@ -1,5 +1,5 @@
 prefix: "&b&lCIV&f&lPVP"
-store-url: "https://www.patreon.com/c/CivPVP"
+store-url: "https://civpvp.net/store"
 lore-editor-url: "https://civpvp.net/lore-editor"
 prefix-max-length: 16
 trim-cooldown-hours: 12
@@ -47,6 +47,27 @@ moderation:
     - "[Dev]"
     - "[Helper]"
     - "[Server]"
+
+# How often each server checks whether another server changed an online player's grants, lore credits or
+# tokens (store delivery, refund, token redemption, staff grant). One indexed query per check for all players.
+entitlement-refresh-seconds: 15
+
+# Store wording shown on locked cosmetics. Ranks themselves are LuckPerms groups that grant
+# civ.cosmetic.rarity.<rarity>, civ.cosmetic.trim.all, civ.cosmetic.title.all and civ.cosmetic.killmsg.all.
+store:
+  rarity-ranks:
+    common: "&7Iron"
+    rare: "&bDiamond"
+    epic: "&dNetherite"
+    legendary: "&dNetherite"
+  perk-ranks:
+    title: "&bDiamond"
+    trim: "&bDiamond"
+    killmsg: "&dNetherite"
+
+# Optional rarity overrides for built-in cosmetics: <category>.<id>: common|rare|epic|legendary
+# Categories: killeffects, trails, tags. Founder cosmetics stay Founder-exclusive.
+cosmetic-rarities: {}
 
 # Minimum time between kill-effect / trail previews from the GUI, per player.
 preview-cooldown-ms: 3000

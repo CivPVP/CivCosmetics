@@ -22,6 +22,9 @@ dependencies {
     }
 
     testImplementation("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    // Storage tests run only when CIVCOSMETICS_TEST_DB_HOST points at a disposable MariaDB/MySQL database.
+    testImplementation("com.zaxxer:HikariCP:5.0.1")
+    testRuntimeOnly("org.mariadb.jdbc:mariadb-java-client:3.5.6")
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
@@ -42,6 +45,7 @@ tasks.processResources {
 
 tasks.test {
     useJUnitPlatform()
+    environment("CIVCOSMETICS_TEST_DB_HOST", System.getenv("CIVCOSMETICS_TEST_DB_HOST") ?: "")
 }
 
 tasks.withType<JavaCompile> {

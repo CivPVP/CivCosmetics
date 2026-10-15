@@ -10,6 +10,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.EnumMap;
 import java.util.HashSet;
 import java.util.List;
@@ -17,6 +19,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.sql.Timestamp;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.bukkit.inventory.ItemStack;
@@ -128,10 +131,66 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                 """);
             statement.executeUpdate("""
-                INSERT INTO civcosmetics_meta (meta_key, meta_value)
-                VALUES ('schema-version', '1')
-                ON DUPLICATE KEY UPDATE meta_value = meta_value
+                CREATE TABLE IF NOT EXISTS civcosmetics_purchases (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    transaction_id VARCHAR(64) NOT NULL,
+                    package_id VARCHAR(48) NOT NULL,
+                    uuid CHAR(36) NOT NULL,
+                    kind VARCHAR(16) NOT NULL,
+                    rarity VARCHAR(16) NULL,
+                    amount INT NOT NULL,
+                    spent INT NOT NULL DEFAULT 0,
+                    status VARCHAR(16) NOT NULL,
+                    note VARCHAR(255) NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (transaction_id, package_id),
+                    UNIQUE KEY uq_civcosmetics_purchases_id (id),
+                    INDEX idx_civcosmetics_purchases_uuid (uuid, kind, status)
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                 """);
+            statement.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS civcosmetics_token_redemptions (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    uuid CHAR(36) NOT NULL,
+                    transaction_id VARCHAR(64) NOT NULL,
+                    package_id VARCHAR(48) NOT NULL,
+                    rarity VARCHAR(16) NOT NULL,
+                    category VARCHAR(32) NOT NULL,
+                    grant_id VARCHAR(128) NOT NULL,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    redeemed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    INDEX idx_civcosmetics_redemptions_tx (transaction_id, package_id),
+                    INDEX idx_civcosmetics_redemptions_uuid (uuid)
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                """);
+        }
+        // Schema 2: other servers bump this when they change a player's grants, credits or tokens.
+        if (!columnExists(connection, "civcosmetics_player_state", "entitlements_version")) {
+            try (Statement statement = connection.createStatement()) {
+                statement.executeUpdate("ALTER TABLE civcosmetics_player_state ADD COLUMN entitlements_version BIGINT NOT NULL DEFAULT 0");
+            }
+        }
+        try (Statement statement = connection.createStatement()) {
+            statement.executeUpdate("""
+                INSERT INTO civcosmetics_meta (meta_key, meta_value)
+                VALUES ('schema-version', '2')
+                ON DUPLICATE KEY UPDATE meta_value = '2'
+                """);
+        }
+    }
+
+    private boolean columnExists(Connection connection, String table, String column) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+            SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+            """)) {
+            statement.setString(1, table);
+            statement.setString(2, column);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next();
+            }
         }
     }
 
@@ -141,6 +200,7 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
         try (Connection connection = getConnection()) {
             loadState(connection, data);
             loadGrants(connection, data);
+            data.tokens.putAll(loadTokens(connection, uuid));
             loadLoreHistory(connection, data);
             grantSnapshots.put(uuid, normalizedGrantMap(data));
             return data;
@@ -152,7 +212,7 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
     private void loadState(Connection connection, CivCosmeticsPlugin.PlayerData data) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
             SELECT selected_kill_effect, selected_trail, selected_tag, custom_prefix, saved_custom_prefix,
-                   kill_message, pending_kill_message, lore_credits, last_trim
+                   kill_message, pending_kill_message, lore_credits, last_trim, entitlements_version
             FROM civcosmetics_player_state
             WHERE uuid = ?
             """)) {
@@ -170,6 +230,7 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                 data.pendingKillMessage = result.getString("pending_kill_message");
                 data.loreCredits = result.getInt("lore_credits");
                 data.lastTrim = result.getLong("last_trim");
+                data.entitlementsVersion = result.getLong("entitlements_version");
             }
         }
     }
@@ -244,7 +305,8 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             try {
                 saveState(connection, data);
                 if (syncGrants && grantsChanged(data.uuid, currentGrants)) {
-                    saveGrants(connection, data);
+                    saveGrantChanges(connection, data.uuid, grantSnapshots.get(data.uuid), currentGrants);
+                    bumpVersion(connection, data.uuid);
                     savedGrants = currentGrants;
                 }
                 savedLoreHistory = saveLoreHistory(connection, data);
@@ -290,12 +352,13 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
         return grants;
     }
 
+    /** Lore credits are deliberately absent: they only change through atomic deltas, so a stale copy can't overwrite them. */
     private void saveState(Connection connection, CivCosmeticsPlugin.PlayerData data) throws SQLException {
         try (PreparedStatement statement = connection.prepareStatement("""
             INSERT INTO civcosmetics_player_state
                 (uuid, selected_kill_effect, selected_trail, selected_tag, custom_prefix, saved_custom_prefix,
-                 kill_message, pending_kill_message, lore_credits, last_trim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 kill_message, pending_kill_message, last_trim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 selected_kill_effect = VALUES(selected_kill_effect),
                 selected_trail = VALUES(selected_trail),
@@ -304,7 +367,6 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                 saved_custom_prefix = VALUES(saved_custom_prefix),
                 kill_message = VALUES(kill_message),
                 pending_kill_message = VALUES(pending_kill_message),
-                lore_credits = VALUES(lore_credits),
                 last_trim = VALUES(last_trim)
             """)) {
             statement.setString(1, data.uuid.toString());
@@ -315,30 +377,43 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             statement.setString(6, data.savedCustomPrefix);
             statement.setString(7, data.killMessage);
             statement.setString(8, data.pendingKillMessage);
-            statement.setInt(9, data.loreCredits);
-            statement.setLong(10, data.lastTrim);
+            statement.setLong(9, data.lastTrim);
             statement.executeUpdate();
         }
     }
 
-    private void saveGrants(Connection connection, CivCosmeticsPlugin.PlayerData data) throws SQLException {
-        try (PreparedStatement delete = connection.prepareStatement("DELETE FROM civcosmetics_grants WHERE uuid = ?")) {
-            delete.setString(1, data.uuid.toString());
-            delete.executeUpdate();
-        }
-        try (PreparedStatement insert = connection.prepareStatement("""
-            INSERT INTO civcosmetics_grants (uuid, category, grant_id)
-            VALUES (?, ?, ?)
-            """)) {
-            for (var entry : data.grants.entrySet()) {
-                for (String grant : entry.getValue()) {
-                    insert.setString(1, data.uuid.toString());
-                    insert.setString(2, entry.getKey().id);
-                    insert.setString(3, grant.toLowerCase(Locale.ROOT));
+    /**
+     * Writes only the grants this server added or removed since it last read them. Grants another server added in the
+     * meantime are left alone. With no previous read (legacy import) it only adds.
+     */
+    private void saveGrantChanges(Connection connection, UUID uuid,
+                                  Map<CivCosmeticsPlugin.Category, Set<String>> previous,
+                                  Map<CivCosmeticsPlugin.Category, Set<String>> current) throws SQLException {
+        try (PreparedStatement insert = connection.prepareStatement(
+                 "INSERT IGNORE INTO civcosmetics_grants (uuid, category, grant_id) VALUES (?, ?, ?)");
+             PreparedStatement delete = connection.prepareStatement(
+                 "DELETE FROM civcosmetics_grants WHERE uuid = ? AND category = ? AND grant_id = ?")) {
+            for (CivCosmeticsPlugin.Category category : CivCosmeticsPlugin.Category.values()) {
+                Set<String> now = current.get(category);
+                Set<String> before = previous == null ? Set.of() : previous.get(category);
+                for (String grant : now) {
+                    if (before.contains(grant)) continue;
+                    insert.setString(1, uuid.toString());
+                    insert.setString(2, category.id);
+                    insert.setString(3, grant);
                     insert.addBatch();
+                }
+                if (previous == null) continue;
+                for (String grant : before) {
+                    if (now.contains(grant)) continue;
+                    delete.setString(1, uuid.toString());
+                    delete.setString(2, category.id);
+                    delete.setString(3, grant);
+                    delete.addBatch();
                 }
             }
             insert.executeBatch();
+            delete.executeBatch();
         }
     }
 
@@ -417,6 +492,424 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             statement.executeUpdate();
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to mark YAML import complete", e);
+        }
+    }
+
+    @Override
+    public void importLegacy(CivCosmeticsPlugin.PlayerData data) {
+        try (Connection connection = getConnection()) {
+            inTransaction(connection, () -> {
+                saveState(connection, data);
+                if (data.loreCredits > 0) addLoreCredits(connection, data.uuid, data.loreCredits);
+                saveGrantChanges(connection, data.uuid, null, normalizedGrantMap(data));
+                saveLoreHistory(connection, data);
+                return null;
+            });
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to import cosmetics for " + data.uuid, e);
+        }
+    }
+
+    @Override
+    public Store.Entitlements loadEntitlements(UUID uuid) {
+        CivCosmeticsPlugin.PlayerData data = new CivCosmeticsPlugin.PlayerData(uuid);
+        try (Connection connection = getConnection()) {
+            int credits = 0;
+            long version = 0;
+            try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT lore_credits, entitlements_version FROM civcosmetics_player_state WHERE uuid = ?")) {
+                statement.setString(1, uuid.toString());
+                try (ResultSet result = statement.executeQuery()) {
+                    if (result.next()) {
+                        credits = result.getInt("lore_credits");
+                        version = result.getLong("entitlements_version");
+                    }
+                }
+            }
+            loadGrants(connection, data);
+            Map<CivCosmeticsPlugin.Category, Set<String>> grants = normalizedGrantMap(data);
+            grantSnapshots.put(uuid, normalizedGrantMap(data));
+            return new Store.Entitlements(grants, credits, loadTokens(connection, uuid), version);
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to load entitlements for " + uuid, e);
+        }
+    }
+
+    private Map<Rarity, Integer> loadTokens(Connection connection, UUID uuid) throws SQLException {
+        Map<Rarity, Integer> tokens = Store.emptyTokens();
+        try (PreparedStatement statement = connection.prepareStatement("""
+            SELECT rarity, SUM(amount - spent) AS remaining
+            FROM civcosmetics_purchases
+            WHERE uuid = ? AND kind = 'token' AND status = 'granted'
+            GROUP BY rarity
+            """)) {
+            statement.setString(1, uuid.toString());
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    Rarity rarity = Rarity.parse(result.getString("rarity"));
+                    if (rarity != null) tokens.put(rarity, Math.max(0, result.getInt("remaining")));
+                }
+            }
+        }
+        return tokens;
+    }
+
+    @Override
+    public Map<UUID, Long> entitlementVersions(Collection<UUID> uuids) {
+        Map<UUID, Long> versions = new HashMap<>();
+        if (uuids.isEmpty()) return versions;
+        List<UUID> all = new ArrayList<>(uuids);
+        try (Connection connection = getConnection()) {
+            for (int start = 0; start < all.size(); start += 200) {
+                List<UUID> chunk = all.subList(start, Math.min(all.size(), start + 200));
+                String placeholders = String.join(",", java.util.Collections.nCopies(chunk.size(), "?"));
+                try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT uuid, entitlements_version FROM civcosmetics_player_state WHERE uuid IN (" + placeholders + ")")) {
+                    for (int i = 0; i < chunk.size(); i++) statement.setString(i + 1, chunk.get(i).toString());
+                    try (ResultSet result = statement.executeQuery()) {
+                        while (result.next()) {
+                            versions.put(UUID.fromString(result.getString("uuid")), result.getLong("entitlements_version"));
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read entitlement versions", e);
+        }
+        return versions;
+    }
+
+    @Override
+    public int addLoreCredits(UUID uuid, int delta) {
+        try (Connection connection = getConnection()) {
+            return inTransaction(connection, () -> addLoreCredits(connection, uuid, delta));
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to change lore credits for " + uuid, e);
+        }
+    }
+
+    private int addLoreCredits(Connection connection, UUID uuid, int delta) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+            INSERT INTO civcosmetics_player_state (uuid, lore_credits, entitlements_version)
+            VALUES (?, GREATEST(0, ?), 1)
+            ON DUPLICATE KEY UPDATE
+                lore_credits = GREATEST(0, lore_credits + ?),
+                entitlements_version = entitlements_version + 1
+            """)) {
+            statement.setString(1, uuid.toString());
+            statement.setInt(2, delta);
+            statement.setInt(3, delta);
+            statement.executeUpdate();
+        }
+        return loreCredits(connection, uuid, false);
+    }
+
+    private int loreCredits(Connection connection, UUID uuid, boolean lock) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+            "SELECT lore_credits FROM civcosmetics_player_state WHERE uuid = ?" + (lock ? " FOR UPDATE" : ""))) {
+            statement.setString(1, uuid.toString());
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? result.getInt(1) : 0;
+            }
+        }
+    }
+
+    @Override
+    public boolean spendLoreCredit(UUID uuid) {
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement("""
+                 UPDATE civcosmetics_player_state
+                 SET lore_credits = lore_credits - 1, entitlements_version = entitlements_version + 1
+                 WHERE uuid = ? AND lore_credits > 0
+                 """)) {
+            statement.setString(1, uuid.toString());
+            return statement.executeUpdate() == 1;
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to spend a lore credit for " + uuid, e);
+        }
+    }
+
+    @Override
+    public Store.Outcome grantTokens(UUID uuid, Rarity rarity, int amount, String transactionId, String packageId) {
+        return recordPurchase(uuid, Store.KIND_TOKEN, rarity, amount, transactionId, packageId, null);
+    }
+
+    @Override
+    public Store.Outcome grantLoreCredits(UUID uuid, int amount, String transactionId, String packageId) {
+        return recordPurchase(uuid, Store.KIND_LORE, null, amount, transactionId, packageId,
+            connection -> addLoreCredits(connection, uuid, amount));
+    }
+
+    @Override
+    public Store.Outcome recordFounder(UUID uuid, String transactionId, String packageId) {
+        return recordPurchase(uuid, Store.KIND_FOUNDER, null, 1, transactionId, packageId, null);
+    }
+
+    /**
+     * Inserts the ledger row and applies its effect in one database transaction. The (transaction, package) primary
+     * key makes a repeated delivery a no-op even when two deliveries race.
+     */
+    private Store.Outcome recordPurchase(UUID uuid, String kind, Rarity rarity, int amount, String transactionId,
+                                         String packageId, SqlAction effect) {
+        try (Connection connection = getConnection()) {
+            return inTransaction(connection, () -> {
+                try (PreparedStatement insert = connection.prepareStatement("""
+                    INSERT IGNORE INTO civcosmetics_purchases
+                        (transaction_id, package_id, uuid, kind, rarity, amount, spent, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, 'granted')
+                    """)) {
+                    insert.setString(1, transactionId);
+                    insert.setString(2, packageId);
+                    insert.setString(3, uuid.toString());
+                    insert.setString(4, kind);
+                    insert.setString(5, rarity == null ? null : rarity.id);
+                    insert.setInt(6, amount);
+                    if (insert.executeUpdate() == 0) return Store.Outcome.DUPLICATE;
+                }
+                if (effect != null) effect.run(connection);
+                else bumpVersion(connection, uuid);
+                return Store.Outcome.APPLIED;
+            });
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to record purchase " + transactionId + "/" + packageId, e);
+        }
+    }
+
+    @Override
+    public Store.RefundResult refund(String transactionId) {
+        try (Connection connection = getConnection()) {
+            return inTransaction(connection, () -> {
+                List<Store.LedgerEntry> rows = new ArrayList<>();
+                try (PreparedStatement select = connection.prepareStatement("""
+                    SELECT transaction_id, package_id, uuid, kind, rarity, amount, spent, status, created_at, note
+                    FROM civcosmetics_purchases
+                    WHERE transaction_id = ? AND status = 'granted'
+                    FOR UPDATE
+                    """)) {
+                    select.setString(1, transactionId);
+                    try (ResultSet result = select.executeQuery()) {
+                        while (result.next()) rows.add(ledgerEntry(result));
+                    }
+                }
+                int tokensRemoved = 0;
+                int cosmeticsRevoked = 0;
+                int creditsRemoved = 0;
+                int shortfall = 0;
+                for (Store.LedgerEntry row : rows) {
+                    UUID uuid = UUID.fromString(row.uuid());
+                    String note = null;
+                    switch (row.kind()) {
+                        case Store.KIND_TOKEN -> {
+                            tokensRemoved += Math.max(0, row.amount() - row.spent());
+                            int revoked = revokeRedemptions(connection, row.transactionId(), row.packageId());
+                            cosmeticsRevoked += revoked;
+                            if (revoked > 0) note = "revoked " + revoked + " redeemed cosmetic(s)";
+                        }
+                        case Store.KIND_LORE -> {
+                            int balance = loreCredits(connection, uuid, true);
+                            int removed = Math.min(balance, row.amount());
+                            if (removed > 0) addLoreCredits(connection, uuid, -removed);
+                            creditsRemoved += removed;
+                            if (removed < row.amount()) {
+                                shortfall += row.amount() - removed;
+                                note = (row.amount() - removed) + " credit(s) were already spent";
+                            }
+                        }
+                        default -> {
+                            // Founder and other permission-based grants are revoked by the LuckPerms refund command.
+                        }
+                    }
+                    try (PreparedStatement update = connection.prepareStatement("""
+                        UPDATE civcosmetics_purchases SET status = 'refunded', note = ?
+                        WHERE transaction_id = ? AND package_id = ?
+                        """)) {
+                        update.setString(1, note);
+                        update.setString(2, row.transactionId());
+                        update.setString(3, row.packageId());
+                        update.executeUpdate();
+                    }
+                    bumpVersion(connection, uuid);
+                }
+                return new Store.RefundResult(rows.size(), tokensRemoved, cosmeticsRevoked, creditsRemoved, shortfall);
+            });
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to refund " + transactionId, e);
+        }
+    }
+
+    private int revokeRedemptions(Connection connection, String transactionId, String packageId) throws SQLException {
+        List<String[]> redeemed = new ArrayList<>();
+        try (PreparedStatement select = connection.prepareStatement("""
+            SELECT id, uuid, category, grant_id FROM civcosmetics_token_redemptions
+            WHERE transaction_id = ? AND package_id = ? AND status = 'active'
+            FOR UPDATE
+            """)) {
+            select.setString(1, transactionId);
+            select.setString(2, packageId);
+            try (ResultSet result = select.executeQuery()) {
+                while (result.next()) {
+                    redeemed.add(new String[] {result.getString("id"), result.getString("uuid"),
+                        result.getString("category"), result.getString("grant_id")});
+                }
+            }
+        }
+        try (PreparedStatement delete = connection.prepareStatement(
+                 "DELETE FROM civcosmetics_grants WHERE uuid = ? AND category = ? AND grant_id = ?");
+             PreparedStatement mark = connection.prepareStatement(
+                 "UPDATE civcosmetics_token_redemptions SET status = 'revoked' WHERE id = ?")) {
+            for (String[] row : redeemed) {
+                delete.setString(1, row[1]);
+                delete.setString(2, row[2]);
+                delete.setString(3, row[3]);
+                delete.executeUpdate();
+                mark.setLong(1, Long.parseLong(row[0]));
+                mark.executeUpdate();
+            }
+        }
+        return redeemed.size();
+    }
+
+    @Override
+    public Store.RedeemOutcome redeemToken(UUID uuid, Rarity rarity, CivCosmeticsPlugin.Category category, String cosmeticId) {
+        String grantId = cosmeticId.toLowerCase(Locale.ROOT);
+        try (Connection connection = getConnection()) {
+            return inTransaction(connection, () -> {
+                try (PreparedStatement owned = connection.prepareStatement("""
+                    SELECT 1 FROM civcosmetics_grants
+                    WHERE uuid = ? AND category = ? AND (grant_id = ? OR grant_id = 'all')
+                    """)) {
+                    owned.setString(1, uuid.toString());
+                    owned.setString(2, category.id);
+                    owned.setString(3, grantId);
+                    try (ResultSet result = owned.executeQuery()) {
+                        if (result.next()) return Store.RedeemOutcome.ALREADY_OWNED;
+                    }
+                }
+                String transactionId;
+                String packageId;
+                // Oldest unspent token first, so a refund of a newer purchase revokes as little as possible.
+                try (PreparedStatement select = connection.prepareStatement("""
+                    SELECT transaction_id, package_id FROM civcosmetics_purchases
+                    WHERE uuid = ? AND kind = 'token' AND rarity = ? AND status = 'granted' AND spent < amount
+                    ORDER BY id
+                    LIMIT 1
+                    FOR UPDATE
+                    """)) {
+                    select.setString(1, uuid.toString());
+                    select.setString(2, rarity.id);
+                    try (ResultSet result = select.executeQuery()) {
+                        if (!result.next()) return Store.RedeemOutcome.NO_TOKEN;
+                        transactionId = result.getString("transaction_id");
+                        packageId = result.getString("package_id");
+                    }
+                }
+                try (PreparedStatement spend = connection.prepareStatement("""
+                    UPDATE civcosmetics_purchases SET spent = spent + 1
+                    WHERE transaction_id = ? AND package_id = ? AND status = 'granted' AND spent < amount
+                    """)) {
+                    spend.setString(1, transactionId);
+                    spend.setString(2, packageId);
+                    if (spend.executeUpdate() != 1) {
+                        connection.rollback();
+                        return Store.RedeemOutcome.NO_TOKEN;
+                    }
+                }
+                try (PreparedStatement grant = connection.prepareStatement(
+                    "INSERT IGNORE INTO civcosmetics_grants (uuid, category, grant_id) VALUES (?, ?, ?)")) {
+                    grant.setString(1, uuid.toString());
+                    grant.setString(2, category.id);
+                    grant.setString(3, grantId);
+                    grant.executeUpdate();
+                }
+                try (PreparedStatement record = connection.prepareStatement("""
+                    INSERT INTO civcosmetics_token_redemptions
+                        (uuid, transaction_id, package_id, rarity, category, grant_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """)) {
+                    record.setString(1, uuid.toString());
+                    record.setString(2, transactionId);
+                    record.setString(3, packageId);
+                    record.setString(4, rarity.id);
+                    record.setString(5, category.id);
+                    record.setString(6, grantId);
+                    record.executeUpdate();
+                }
+                bumpVersion(connection, uuid);
+                return Store.RedeemOutcome.REDEEMED;
+            });
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to redeem a " + rarity.id + " token for " + uuid, e);
+        }
+    }
+
+    @Override
+    public List<Store.LedgerEntry> ledger(UUID uuid, int limit) {
+        List<Store.LedgerEntry> entries = new ArrayList<>();
+        try (Connection connection = getConnection();
+             PreparedStatement statement = connection.prepareStatement("""
+                 SELECT transaction_id, package_id, uuid, kind, rarity, amount, spent, status, created_at, note
+                 FROM civcosmetics_purchases
+                 WHERE uuid = ?
+                 ORDER BY id DESC
+                 LIMIT ?
+                 """)) {
+            statement.setString(1, uuid.toString());
+            statement.setInt(2, Math.max(1, limit));
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) entries.add(ledgerEntry(result));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read the purchase ledger for " + uuid, e);
+        }
+        return entries;
+    }
+
+    private static Store.LedgerEntry ledgerEntry(ResultSet result) throws SQLException {
+        Timestamp created = result.getTimestamp("created_at");
+        return new Store.LedgerEntry(
+            result.getString("transaction_id"),
+            result.getString("package_id"),
+            result.getString("uuid"),
+            result.getString("kind"),
+            result.getString("rarity"),
+            result.getInt("amount"),
+            result.getInt("spent"),
+            result.getString("status"),
+            created == null ? 0L : created.getTime(),
+            result.getString("note"));
+    }
+
+    /** Tells other servers this player's grants, credits or tokens changed, so they reload them. */
+    private void bumpVersion(Connection connection, UUID uuid) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("""
+            INSERT INTO civcosmetics_player_state (uuid, entitlements_version) VALUES (?, 1)
+            ON DUPLICATE KEY UPDATE entitlements_version = entitlements_version + 1
+            """)) {
+            statement.setString(1, uuid.toString());
+            statement.executeUpdate();
+        }
+    }
+
+    private interface SqlAction {
+        void run(Connection connection) throws SQLException;
+    }
+
+    private interface SqlWork<T> {
+        T run() throws SQLException;
+    }
+
+    private static <T> T inTransaction(Connection connection, SqlWork<T> work) throws SQLException {
+        boolean autoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            T result = work.run();
+            connection.commit();
+            return result;
+        } catch (SQLException | RuntimeException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(autoCommit);
         }
     }
 
