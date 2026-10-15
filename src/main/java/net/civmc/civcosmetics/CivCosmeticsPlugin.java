@@ -795,11 +795,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 return true;
             }
             UUID uuid = Store.parseUuid(args[0]);
-            int amount = parseInt(args[1], 0);
+            int amount = Store.parseAmount(args[1]);
             String transaction = args[2];
-            String packageId = args.length > 3 ? args[3].toLowerCase(Locale.ROOT) : "lore_" + amount;
-            if (uuid == null || amount <= 0 || amount > 64 || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
-                msg(sender, "&cUsage: /addlorecredit <uuid> <amount 1-64> <transaction> [package]");
+            String packageId = args.length > 3 ? args[3].toLowerCase(Locale.ROOT) : "lore";
+            if (uuid == null || amount <= 0 || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
+                msg(sender, "&cUsage: /addlorecredit <uuid> <amount|NxQuantity> <transaction> [package]");
                 return true;
             }
             submitStoreOp(sender, new StoreOp(Store.KIND_LORE, uuid, null, amount, transaction, packageId));
@@ -850,12 +850,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             case "token" -> {
                 UUID uuid = args.length > 1 ? Store.parseUuid(args[1]) : null;
                 Rarity rarity = args.length > 2 ? Rarity.parse(args[2]) : null;
-                int amount = args.length > 3 ? parseInt(args[3], 0) : 0;
+                int amount = args.length > 3 ? Store.parseAmount(args[3]) : -1;
                 String transaction = args.length > 4 ? args[4] : null;
                 String packageId = args.length > 5 ? args[5].toLowerCase(Locale.ROOT) : rarity == null ? null : "token_" + rarity.id;
-                if (uuid == null || rarity == null || amount <= 0 || amount > 64
+                if (uuid == null || rarity == null || amount <= 0
                     || !Store.validTransaction(transaction) || !Store.validPackage(packageId)) {
-                    msg(sender, "&cUsage: /cosadmin token <uuid> <common|rare|epic|legendary> <amount 1-64> <transaction> [package]");
+                    msg(sender, "&cUsage: /cosadmin token <uuid> <common|rare|epic|legendary> <amount|NxQuantity> <transaction> [package]");
                     return true;
                 }
                 submitStoreOp(sender, new StoreOp(Store.KIND_TOKEN, uuid, rarity, amount, transaction, packageId));

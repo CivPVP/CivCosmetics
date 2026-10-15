@@ -40,6 +40,20 @@ final class Store {
         }
     }
 
+    /** Largest amount one delivery may grant, so a mistyped command can't mint thousands of tokens. */
+    static final int MAX_AMOUNT = 256;
+
+    /**
+     * Parses a delivery amount: {@code N}, or {@code NxM} so a Tebex command can multiply a package size by
+     * {@code {purchaseQuantity}} (for example {@code 3x2}). Returns -1 when invalid or above {@link #MAX_AMOUNT}.
+     */
+    static int parseAmount(@Nullable String raw) {
+        if (raw == null || !raw.matches("\\d{1,4}(x\\d{1,4})?")) return -1;
+        String[] parts = raw.split("x");
+        long amount = Long.parseLong(parts[0]) * (parts.length > 1 ? Long.parseLong(parts[1]) : 1L);
+        return amount >= 1 && amount <= MAX_AMOUNT ? (int) amount : -1;
+    }
+
     static boolean validTransaction(@Nullable String raw) {
         return raw != null && TRANSACTION.matcher(raw).matches();
     }

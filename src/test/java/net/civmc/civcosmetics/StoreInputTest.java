@@ -32,6 +32,17 @@ class StoreInputTest {
     }
 
     @Test
+    void amountsAcceptAQuantityMultiplierWithinTheCap() {
+        assertEquals(3, Store.parseAmount("3"));
+        assertEquals(6, Store.parseAmount("3x2"));
+        assertEquals(-1, Store.parseAmount("0"));
+        assertEquals(-1, Store.parseAmount("3x0"));
+        assertEquals(-1, Store.parseAmount("100x3"));
+        assertEquals(-1, Store.parseAmount("-1"));
+        assertEquals(-1, Store.parseAmount("{purchaseQuantity}"));
+    }
+
+    @Test
     void queuedOperationsRoundTrip() {
         StoreOp token = new StoreOp(Store.KIND_TOKEN, PLAYER, Rarity.EPIC, 2, "tbx-1", "token_epic");
         StoreOp lore = new StoreOp(Store.KIND_LORE, PLAYER, null, 3, "tbx-2", "lore_3");
