@@ -3,7 +3,6 @@ package net.civmc.civcosmetics;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -22,7 +21,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.util.io.BukkitObjectInputStream;
-import org.bukkit.util.io.BukkitObjectOutputStream;
 
 final class MysqlCosmeticsStorage implements CosmeticsStorage {
 
@@ -31,6 +29,10 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
     private final MysqlConfig config;
     private final Logger logger;
     private final Map<UUID, Map<CivCosmeticsPlugin.Category, Set<String>>> grantSnapshots = new ConcurrentHashMap<>();
+    /** Fingerprint of the lore-history rows last loaded or written per player, so unchanged history is not rewritten. */
+    private final Map<UUID, String> loreHistorySnapshots = new ConcurrentHashMap<>();
+    /** Lore-history blobs that failed to deserialize on load, written back unchanged so a save never deletes them. */
+    private final Map<UUID, List<byte[]>> unreadableLoreHistory = new ConcurrentHashMap<>();
     private HikariDataSource dataSource;
 
     MysqlCosmeticsStorage(MysqlConfig config, Logger logger) {
@@ -198,14 +200,27 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             ORDER BY slot_index ASC
             """)) {
             statement.setString(1, data.uuid.toString());
+            List<byte[]> stored = new ArrayList<>();
+            List<byte[]> unreadable = new ArrayList<>();
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
-                    ItemStack item = deserializeItem(result.getBytes("item_blob"));
+                    byte[] blob = result.getBytes("item_blob");
+                    stored.add(blob);
+                    ItemStack item = deserializeItem(blob);
                     if (item != null) {
                         data.loreHistory.add(item);
+                    } else {
+                        unreadable.add(blob);
                     }
                 }
             }
+            if (unreadable.isEmpty()) {
+                unreadableLoreHistory.remove(data.uuid);
+            } else {
+                logger.warning("Keeping " + unreadable.size() + " unreadable lore history item(s) for " + data.uuid);
+                unreadableLoreHistory.put(data.uuid, List.copyOf(unreadable));
+            }
+            loreHistorySnapshots.put(data.uuid, LoreHistoryFormat.fingerprint(stored));
         }
     }
 
@@ -222,6 +237,7 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
     private void save(CivCosmeticsPlugin.PlayerData data, boolean syncGrants) {
         Map<CivCosmeticsPlugin.Category, Set<String>> currentGrants = syncGrants ? normalizedGrantMap(data) : null;
         Map<CivCosmeticsPlugin.Category, Set<String>> savedGrants = null;
+        String savedLoreHistory = null;
         try (Connection connection = getConnection()) {
             boolean autoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
@@ -231,10 +247,13 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                     saveGrants(connection, data);
                     savedGrants = currentGrants;
                 }
-                saveLoreHistory(connection, data);
+                savedLoreHistory = saveLoreHistory(connection, data);
                 connection.commit();
                 if (savedGrants != null) {
                     grantSnapshots.put(data.uuid, savedGrants);
+                }
+                if (savedLoreHistory != null) {
+                    loreHistorySnapshots.put(data.uuid, savedLoreHistory);
                 }
             } catch (SQLException e) {
                 connection.rollback();
@@ -323,7 +342,18 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
         }
     }
 
-    private void saveLoreHistory(Connection connection, CivCosmeticsPlugin.PlayerData data) throws SQLException {
+    /** Rewrites the history rows only when they differ from what is stored. Returns the new fingerprint, or null if nothing was written. */
+    private String saveLoreHistory(Connection connection, CivCosmeticsPlugin.PlayerData data) throws SQLException {
+        List<byte[]> blobs = LoreHistoryFormat.rowsToStore(
+            unreadableLoreHistory.getOrDefault(data.uuid, List.of()), data.loreHistory, this::serializeItem);
+        if (blobs == null) {
+            logger.warning("Not saving lore history for " + data.uuid + ": an item failed to serialize");
+            return null;
+        }
+        String fingerprint = LoreHistoryFormat.fingerprint(blobs);
+        if (fingerprint.equals(loreHistorySnapshots.get(data.uuid))) {
+            return null;
+        }
         try (PreparedStatement delete = connection.prepareStatement("DELETE FROM civcosmetics_lore_history WHERE uuid = ?")) {
             delete.setString(1, data.uuid.toString());
             delete.executeUpdate();
@@ -332,18 +362,15 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             INSERT INTO civcosmetics_lore_history (uuid, slot_index, item_blob)
             VALUES (?, ?, ?)
             """)) {
-            for (int index = 0; index < data.loreHistory.size(); index++) {
-                byte[] item = serializeItem(data.loreHistory.get(index));
-                if (item == null) {
-                    continue;
-                }
+            for (int index = 0; index < blobs.size(); index++) {
                 insert.setString(1, data.uuid.toString());
                 insert.setInt(2, index);
-                insert.setBytes(3, item);
+                insert.setBytes(3, blobs.get(index));
                 insert.addBatch();
             }
             insert.executeBatch();
         }
+        return fingerprint;
     }
 
     @Override
@@ -398,27 +425,37 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
         HikariDataSource currentDataSource = dataSource;
         dataSource = null;
         grantSnapshots.clear();
+        loreHistorySnapshots.clear();
+        unreadableLoreHistory.clear();
         if (currentDataSource != null) {
             currentDataSource.close();
         }
     }
 
     private byte[] serializeItem(ItemStack item) {
-        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-             BukkitObjectOutputStream output = new BukkitObjectOutputStream(bytes)) {
-            output.writeObject(item);
-            return bytes.toByteArray();
-        } catch (IOException e) {
+        try {
+            return item.serializeAsBytes();
+        } catch (RuntimeException e) {
             logger.warning("Failed to serialize lore history item: " + e.getMessage());
             return null;
         }
     }
 
+    @SuppressWarnings("deprecation")
     private ItemStack deserializeItem(byte[] bytes) {
-        try (BukkitObjectInputStream input = new BukkitObjectInputStream(new ByteArrayInputStream(bytes))) {
-            Object object = input.readObject();
-            return object instanceof ItemStack item ? item : null;
-        } catch (IOException | ClassNotFoundException e) {
+        if (bytes == null) {
+            return null;
+        }
+        try {
+            if (LoreHistoryFormat.isLegacyJavaSerialization(bytes)) {
+                // Rows written before the serializeAsBytes format. They are rewritten in the new format on the next save.
+                try (BukkitObjectInputStream input = new BukkitObjectInputStream(new ByteArrayInputStream(bytes))) {
+                    Object object = input.readObject();
+                    return object instanceof ItemStack item ? item : null;
+                }
+            }
+            return ItemStack.deserializeBytes(bytes);
+        } catch (IOException | ClassNotFoundException | RuntimeException e) {
             logger.warning("Failed to deserialize lore history item: " + e.getMessage());
             return null;
         }

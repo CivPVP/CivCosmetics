@@ -15,11 +15,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import me.clip.placeholderapi.expansion.PlaceholderExpansion;
@@ -30,6 +33,7 @@ import net.kyori.adventure.text.event.HoverEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextColor;
 import net.kyori.adventure.text.format.TextDecoration;
+import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
@@ -56,6 +60,7 @@ import org.bukkit.entity.Squid;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.ProjectileLaunchEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
@@ -70,6 +75,8 @@ import org.bukkit.event.player.PlayerItemHeldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerSwapHandItemsEvent;
+import org.bukkit.event.world.EntitiesLoadEvent;
+import org.bukkit.event.world.EntitiesUnloadEvent;
 import org.bukkit.inventory.EntityEquipment;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
@@ -82,6 +89,7 @@ import org.bukkit.inventory.meta.SkullMeta;
 import org.bukkit.inventory.meta.trim.ArmorTrim;
 import org.bukkit.inventory.meta.trim.TrimMaterial;
 import org.bukkit.inventory.meta.trim.TrimPattern;
+import org.bukkit.loot.Lootable;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.ServicePriority;
@@ -93,6 +101,14 @@ import org.jetbrains.annotations.Nullable;
 public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
 
     private static final Pattern HEX_COLOR_PATTERN = Pattern.compile("&#([A-Fa-f0-9]{6})");
+    private static final long[] STORAGE_RETRY_DELAYS_MS = {250L, 1_000L, 3_000L};
+    private static final long FAILED_SAVE_RETRY_TICKS = 20L * 30L;
+    private static final long LOAD_RETRY_TICKS = 20L * 10L;
+    private static final int EFFECT_ENTITY_LIFETIME_TICKS = 25;
+    private static final LegacyComponentSerializer LORE_KEY_SERIALIZER = LegacyComponentSerializer.builder()
+        .hexColors()
+        .useUnusualXRepeatedCharacterHexFormat()
+        .build();
 
     private static final List<Integer> TAG_SLOTS = List.of(
         10, 11, 12, 13, 14, 15, 16,
@@ -112,7 +128,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private static final List<Integer> ADMIN_OPTION_SLOTS = TAG_SLOTS;
     private static final List<Integer> ADMIN_CATEGORY_SLOTS = List.of(11, 13, 15, 20, 22, 24);
 
-    private final Map<UUID, PlayerData> players = new HashMap<>();
+    // Read by PlaceholderAPI callbacks, which TAB may run off the main thread.
+    private final Map<UUID, PlayerData> players = new ConcurrentHashMap<>();
     private final List<NamedCosmetic> tags = new ArrayList<>();
     private final List<NamedCosmetic> killEffects = new ArrayList<>();
     private final List<NamedCosmetic> trails = new ArrayList<>();
@@ -124,8 +141,22 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private final Map<UUID, String> pendingLore = new HashMap<>();
     private final Map<UUID, LoreDraft> loreDrafts = new HashMap<>();
     private final Map<UUID, Integer> activeTrailsByPlayer = new HashMap<>();
-    private final Set<UUID> loadingPlayers = new HashSet<>();
-    private final Map<UUID, List<Consumer<PlayerData>>> loadCallbacks = new HashMap<>();
+    private final Set<UUID> loadingPlayers = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, List<Consumer<PlayerData>>> loadCallbacks = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingSave> failedSaves = new ConcurrentHashMap<>();
+    private final AtomicBoolean failedSaveRetryInFlight = new AtomicBoolean();
+    private final Map<UUID, Long> lastEffectPreview = new HashMap<>();
+    private final Set<Entity> effectEntities = new HashSet<>();
+    private LoreGuard loreGuard;
+    /** Deny-list for player-written titles and kill messages (staff impersonation); separate from the lore list. */
+    private LoreGuard moderationGuard;
+    private int killMessageMaxLength;
+    private long linkCooldownMillis;
+    private final Cooldowns linkCooldowns = new Cooldowns();
+    /** Players with an enforceWornTrims task already queued, so a burst of clicks schedules only one. */
+    private final Set<UUID> pendingTrimChecks = ConcurrentHashMap.newKeySet();
+    private boolean loreAllowStacks;
+    private long effectPreviewCooldownMillis;
     private final Map<UUID, List<UUID>> lastManagedPlayerIds = new HashMap<>();
     private Object killMessageProviderProxy;
     private Class<?> killMessageProviderClass;
@@ -161,6 +192,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private Set<Material> weaponLinkMaterials = new HashSet<>();
     private NamespacedKey customLoreNameKey;
     private NamespacedKey customLoreLinesKey;
+    private NamespacedKey ownedLoreKey;
+    private NamespacedKey originalNameKey;
+    private NamespacedKey effectEntityKey;
     private NamespacedKey weaponKillsKey;
     private NamespacedKey weaponCrafterUuidKey;
     private NamespacedKey weaponCrafterNameKey;
@@ -187,6 +221,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         playerFolder = new File(getDataFolder(), "players");
         customLoreNameKey = new NamespacedKey(this, "custom_lore_name");
         customLoreLinesKey = new NamespacedKey(this, "custom_lore_lines");
+        ownedLoreKey = new NamespacedKey(this, "owned_lore");
+        originalNameKey = new NamespacedKey(this, "original_name");
+        effectEntityKey = new NamespacedKey(this, "effect_entity");
         weaponKillsKey = new NamespacedKey(this, "weapon_kills");
         weaponCrafterUuidKey = new NamespacedKey(this, "weapon_crafter_uuid");
         weaponCrafterNameKey = new NamespacedKey(this, "weapon_crafter_name");
@@ -206,6 +243,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         for (Player player : Bukkit.getOnlinePlayers()) {
             loadPlayer(player);
         }
+        Bukkit.getScheduler().runTaskTimer(this, this::retryFailedSaves, FAILED_SAVE_RETRY_TICKS, FAILED_SAVE_RETRY_TICKS);
     }
 
     @Override
@@ -215,16 +253,18 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             expansion.unregister();
         }
         Bukkit.getServicesManager().unregisterAll(this);
+        removeEffectEntities();
         if (storage != null && storageExecutor != null && storageHealthy) {
+            // Flush every loaded player plus any save that failed earlier and is still waiting for a retry.
+            Set<UUID> flushed = new HashSet<>();
             for (PlayerData data : new ArrayList<>(players.values())) {
                 PlayerData snapshot = data.copy();
-                storageExecutor.execute(() -> {
-                    try {
-                        storage.saveState(snapshot);
-                    } catch (RuntimeException e) {
-                        getLogger().warning("Failed to flush cosmetics for " + snapshot.uuid + ": " + e.getMessage());
-                    }
-                });
+                flushed.add(snapshot.uuid);
+                storageExecutor.execute(() -> writeSnapshot(snapshot, false, false));
+            }
+            for (PendingSave pending : new ArrayList<>(failedSaves.values())) {
+                if (flushed.contains(pending.snapshot().uuid)) continue;
+                storageExecutor.execute(() -> writeSnapshot(pending.snapshot(), pending.includeGrants(), false));
             }
         }
         if (storageExecutor != null) {
@@ -250,13 +290,17 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
         try {
             storage = new MysqlCosmeticsStorage(mysql, getLogger());
-            storage.initialize();
+            // A database that is briefly unavailable at boot should not leave the plugin disabled.
+            withRetry(() -> {
+                storage.initialize();
+                return null;
+            });
             if (getConfig().getBoolean("mysql.import-yaml-on-enable", true)) {
                 storageExecutor.execute(() -> {
                     try {
                         YamlCosmeticsImporter.importOnce(storage, playerFolder, getLogger());
                     } catch (RuntimeException e) {
-                        failStorage("import old YAML cosmetics", null, e);
+                        logStorageFailure("import old YAML cosmetics", null, e);
                     }
                 });
             }
@@ -275,6 +319,16 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         prefixMaxLength = getConfig().getInt("prefix-max-length", 16);
         loreMaxLines = Math.max(1, getConfig().getInt("lore.max-lines", 30));
         loreMaxTotalCharacters = Math.max(1, getConfig().getInt("lore.max-total-characters", 4096));
+        loreAllowStacks = getConfig().getBoolean("lore.allow-stacks", false);
+        loreGuard = new LoreGuard(getConfig().contains("lore.denied-text")
+            ? getConfig().getStringList("lore.denied-text")
+            : LoreGuard.DEFAULT_DENIED_TEXT);
+        moderationGuard = new LoreGuard(getConfig().contains("moderation.denied-text")
+            ? getConfig().getStringList("moderation.denied-text")
+            : LoreGuard.DEFAULT_MODERATION_TEXT);
+        killMessageMaxLength = Math.max(1, getConfig().getInt("moderation.kill-message-max-length", 100));
+        linkCooldownMillis = Math.max(0L, getConfig().getLong("weapon-link.cooldown-seconds", 10L)) * 1000L;
+        effectPreviewCooldownMillis = Math.max(0L, getConfig().getLong("preview-cooldown-ms", 3000L));
         trimCooldownHours = getConfig().getInt("trim-cooldown-hours", 12);
         trimEnforcement = getConfig().getBoolean("trim-enforcement", true);
         weaponLinkEnabled = getConfig().getBoolean("weapon-link.enabled", true);
@@ -565,8 +619,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(sender, "&cUsage: /cosadmin <grant|revoke|clear|preset> <player> <category|preset> [id|replace]");
             return true;
         }
-        OfflinePlayer target = Bukkit.getOfflinePlayer(args[1]);
-        if (!requireLoaded(sender, target.getUniqueId(), () -> cosAdmin(sender, args))) return true;
+        resolveTarget(sender, args[1], target -> cosAdmin(sender, args, target));
+        return true;
+    }
+
+    private boolean cosAdmin(CommandSender sender, String[] args, OfflinePlayer target) {
+        if (!requireLoaded(sender, target.getUniqueId(), () -> cosAdmin(sender, args, target))) return true;
         PlayerData data = load(target.getUniqueId());
         if (args[0].equalsIgnoreCase("grantall") || args[0].equalsIgnoreCase("patreon")) {
             int loreCredits = args[0].equalsIgnoreCase("patreon") ? 1 : (args.length > 2 ? parseInt(args[2], 0) : 0);
@@ -638,8 +696,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(sender, "&cUsage: /titleadmin <set|clear> <player> [prefix]");
             return true;
         }
-        OfflinePlayer target = Bukkit.getOfflinePlayer(args[1]);
-        if (!requireLoaded(sender, target.getUniqueId(), () -> titleAdmin(sender, args))) return true;
+        resolveTarget(sender, args[1], target -> titleAdmin(sender, args, target));
+        return true;
+    }
+
+    private boolean titleAdmin(CommandSender sender, String[] args, OfflinePlayer target) {
+        if (!requireLoaded(sender, target.getUniqueId(), () -> titleAdmin(sender, args, target))) return true;
         PlayerData data = load(target.getUniqueId());
         if (args[0].equalsIgnoreCase("clear")) {
             data.customPrefix = null;
@@ -679,18 +741,55 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(sender, "&cUsage: /addlorecredit <player> [amount]");
             return true;
         }
-        OfflinePlayer target = Bukkit.getOfflinePlayer(args[0]);
         int amount = args.length > 1 ? parseInt(args[1], 0) : 1;
         if (amount <= 0) {
             msg(sender, "&cAmount must be positive.");
             return true;
         }
-        if (!requireLoaded(sender, target.getUniqueId(), () -> addLoreCredit(sender, args))) return true;
+        resolveTarget(sender, args[0], target -> addLoreCredit(sender, target, amount));
+        return true;
+    }
+
+    private boolean addLoreCredit(CommandSender sender, OfflinePlayer target, int amount) {
+        if (!requireLoaded(sender, target.getUniqueId(), () -> addLoreCredit(sender, target, amount))) return true;
         PlayerData data = load(target.getUniqueId());
         data.loreCredits += amount;
         save(data);
         msg(sender, "&aAdded &e" + amount + " &alore credits to &f" + target.getName());
         return true;
+    }
+
+    /**
+     * Resolves a player name without blocking the main thread. Online and cached players resolve immediately;
+     * anything else is looked up asynchronously (which may hit Mojang) and the action runs back on the main thread.
+     */
+    private void resolveTarget(CommandSender sender, String name, Consumer<OfflinePlayer> action) {
+        Player online = Bukkit.getPlayerExact(name);
+        if (online != null) {
+            action.accept(online);
+            return;
+        }
+        OfflinePlayer cached = Bukkit.getOfflinePlayerIfCached(name);
+        if (cached != null) {
+            action.accept(cached);
+            return;
+        }
+        msg(sender, "&7Looking up &f" + name + "&7...");
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            OfflinePlayer looked = Bukkit.getOfflinePlayer(name);
+            Bukkit.getScheduler().runTask(this, () -> {
+                if (!isEnabled()) return;
+                // Unknown names fall back to a name-based (version 3) offline UUID; never bind grants to that.
+                if (looked.getUniqueId().version() == 3 && !looked.hasPlayedBefore()) {
+                    msg(sender, "&cCould not resolve player &f" + name + "&c.");
+                    return;
+                }
+                if (!looked.hasPlayedBefore() && !looked.isOnline()) {
+                    msg(sender, "&e" + name + " has never joined; using UUID &f" + looked.getUniqueId() + "&e.");
+                }
+                action.accept(looked);
+            });
+        });
     }
 
     private void sendCosmeticsHelp(CommandSender sender) {
@@ -745,6 +844,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(player, "&cTitle too long! Max " + prefixMaxLength + " visible characters.");
             return;
         }
+        if (moderationGuard.deniedMatch(clean) != null) {
+            msg(player, "&cThat title is not allowed.");
+            return;
+        }
         pendingPrefix.put(player.getUniqueId(), clean);
         openPrefixPreview(player, clean);
     }
@@ -756,6 +859,15 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
         if (!has(player, Category.KILLMSG, "all")) {
             msg(player, "&cYou do not have access to custom kill messages.");
+            return;
+        }
+        raw = LoreGuard.stripObfuscated(raw);
+        if (visibleLength(raw) > killMessageMaxLength) {
+            msg(player, "&cKill message too long! Max " + killMessageMaxLength + " visible characters.");
+            return;
+        }
+        if (moderationGuard.deniedMatch(raw) != null) {
+            msg(player, "&cThat kill message is not allowed.");
             return;
         }
         raw = normalizeKillMessage(raw);
@@ -823,7 +935,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(player, "&cYou do not have any Lore Credits. Get one at &e" + storeUrl + "&c.");
             return;
         }
-        String validation = validateLore(raw);
+        String validation = validateLore(raw, item);
         if (validation != null) {
             msg(player, validation);
             return;
@@ -951,7 +1063,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
     }
 
-    private String validateLore(String raw) {
+    private String validateLore(String raw, ItemStack item) {
+        if (!loreAllowStacks && item.getAmount() > 1) {
+            return "&cCustom lore can only be applied to a single item, not a stack.";
+        }
         String[] parts = raw.split("\\|", -1);
         int loreLines = Math.max(0, parts.length - 1);
         if (loreLines > loreMaxLines) {
@@ -959,6 +1074,13 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
         if (raw.length() > loreMaxTotalCharacters) {
             return "&cThat lore is too long. Max " + loreMaxTotalCharacters + " stored characters.";
+        }
+        // Other plugins recognise items by name/lore text (e.g. FactoryMod "Compacted"); never let players forge it.
+        for (String part : parts) {
+            String denied = loreGuard.deniedMatch(PlainTextComponentSerializer.plainText().serialize(component(part)));
+            if (denied != null) {
+                return "&cThat name or lore contains reserved text (&f" + denied + "&c) used by server items.";
+            }
         }
         return null;
     }
@@ -980,7 +1102,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(player, "&cYou do not have any Lore Credits. Get one at &e" + storeUrl + "&c.");
             return false;
         }
-        String validation = validateLore(raw);
+        String validation = validateLore(raw, item);
         if (validation != null) {
             msg(player, validation);
             return false;
@@ -1002,6 +1124,15 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private void applyLoreToItem(ItemStack item, String raw) {
         String[] parts = raw.split("\\|", -1);
         ItemMeta meta = item.getItemMeta();
+        if (!meta.getPersistentDataContainer().has(customLoreNameKey, PersistentDataType.STRING)) {
+            // Remember a name set by vanilla or another plugin so /clearlore can restore it.
+            if (meta.hasDisplayName()) {
+                meta.getPersistentDataContainer().set(originalNameKey, PersistentDataType.STRING,
+                    GsonComponentSerializer.gson().serialize(meta.displayName()));
+            } else {
+                meta.getPersistentDataContainer().remove(originalNameKey);
+            }
+        }
         meta.displayName(component(parts[0]));
         meta.getPersistentDataContainer().set(customLoreNameKey, PersistentDataType.STRING, parts[0]);
         if (parts.length > 1) {
@@ -1017,12 +1148,37 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         item.setItemMeta(meta);
     }
 
+    /** Removes only what CivCosmetics added; names and lore from vanilla or other plugins are left intact. */
     private void clearLoreFromItem(ItemStack item) {
         ItemMeta meta = item.getItemMeta();
         if (meta == null) return;
-        meta.displayName(null);
-        meta.getPersistentDataContainer().remove(customLoreNameKey);
-        meta.getPersistentDataContainer().remove(customLoreLinesKey);
+        var pdc = meta.getPersistentDataContainer();
+        if (!pdc.has(customLoreNameKey, PersistentDataType.STRING) && !hasCosmeticLoreData(meta)
+            && !pdc.has(ownedLoreKey, PersistentDataType.LIST.strings())) {
+            return; // Nothing of ours on this item: leave it byte-for-byte untouched.
+        }
+        if (!pdc.has(ownedLoreKey, PersistentDataType.LIST.strings()) && hasCosmeticLoreData(meta)) {
+            // Pre-tracking item: its whole lore was rendered by this plugin, so record it as ours before clearing.
+            List<String> legacy = new ArrayList<>();
+            if (meta.lore() != null) {
+                for (Component line : meta.lore()) legacy.add(loreKey(line));
+            }
+            pdc.set(ownedLoreKey, PersistentDataType.LIST.strings(), legacy);
+        }
+        if (pdc.has(customLoreNameKey, PersistentDataType.STRING)) {
+            String original = pdc.get(originalNameKey, PersistentDataType.STRING);
+            Component restored = null;
+            if (original != null) {
+                try {
+                    restored = GsonComponentSerializer.gson().deserialize(original);
+                } catch (RuntimeException ignored) {
+                }
+            }
+            meta.displayName(restored);
+        }
+        pdc.remove(customLoreNameKey);
+        pdc.remove(originalNameKey);
+        pdc.remove(customLoreLinesKey);
         rebuildWeaponLore(meta);
         item.setItemMeta(meta);
     }
@@ -1298,7 +1454,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                     preloadAdminPageTargets(admin, requestedPage, targets);
                 });
             } catch (RuntimeException e) {
-                failStorage("list cosmetics players", admin.getUniqueId(), e);
+                logStorageFailure("list cosmetics players", admin.getUniqueId(), e);
             }
         });
     }
@@ -1477,10 +1633,20 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     public void onInventoryClick(InventoryClickEvent event) {
         if (!(event.getWhoClicked() instanceof Player player)) return;
         if (!(event.getInventory().getHolder() instanceof GuiHolder holder)) {
-            Bukkit.getScheduler().runTask(this, () -> enforceWornTrims(player));
+            if (pendingTrimChecks.add(player.getUniqueId())) {
+                Bukkit.getScheduler().runTask(this, () -> {
+                    pendingTrimChecks.remove(player.getUniqueId());
+                    enforceWornTrims(player);
+                });
+            }
             return;
         }
         event.setCancelled(true);
+        if (holder.menu.admin && !player.hasPermission("civ.cosmetic.admin")) {
+            player.closeInventory();
+            msg(player, "&cNo permission!");
+            return;
+        }
         if (event.getClickedInventory() == null || event.getClickedInventory().getType() == InventoryType.PLAYER) return;
         int slot = event.getRawSlot();
         ItemStack clicked = event.getCurrentItem();
@@ -1550,7 +1716,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             return;
         }
         if (click.isRightClick()) {
-            playKillEffect(effect.id, player.getLocation().add(0, 1, 0), player, true);
+            if (tryPreview(player)) {
+                playKillEffect(effect.id, player.getLocation().add(0, 1, 0), player, true);
+            }
             return;
         }
         data(player).selectedKillEffect = effect.id;
@@ -1577,7 +1745,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             return;
         }
         if (click.isRightClick()) {
-            previewTrail(player, trail.id);
+            if (tryPreview(player)) {
+                previewTrail(player, trail.id);
+            }
             return;
         }
         data(player).selectedTrail = trail.id;
@@ -1985,10 +2155,14 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
         UUID uuid = event.getPlayer().getUniqueId();
-        PlayerData data = players.remove(uuid);
+        PlayerData data = players.get(uuid);
         if (data != null) {
             save(data);
+            players.remove(uuid, data);
         }
+        lastEffectPreview.remove(uuid);
+        linkCooldowns.clear(uuid);
+        pendingTrimChecks.remove(uuid);
         pendingPrefix.remove(uuid);
         pendingLore.remove(uuid);
         loreDrafts.remove(uuid);
@@ -2316,7 +2490,6 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         ItemStack marked = result.clone();
         ItemMeta meta = marked.getItemMeta();
         if (meta == null) return null;
-        snapshotExistingLore(meta);
         WeaponCrafter existing = readWeaponCrafter(meta);
         if (existing == null && source != null && source.hasItemMeta()) {
             existing = readWeaponCrafter(source.getItemMeta());
@@ -2337,7 +2510,6 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         if (!isLinkableWeapon(weapon)) return;
         ItemMeta meta = weapon.getItemMeta();
         if (meta == null) return;
-        snapshotExistingLore(meta);
         Map<UUID, String> kills = readWeaponKills(meta);
         kills.put(victim.getUniqueId(), victim.getName());
         writeWeaponKills(meta, kills);
@@ -2355,6 +2527,13 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(player, "&cHold a sword first.");
             return;
         }
+        long now = System.currentTimeMillis();
+        long wait = linkCooldowns.remainingMillis(player.getUniqueId(), now, linkCooldownMillis);
+        if (wait > 0L) {
+            msg(player, "&cCooldown: Wait " + formatDuration(wait) + " before linking again.");
+            return;
+        }
+        linkCooldowns.mark(player.getUniqueId(), now);
         ItemMeta meta = item.getItemMeta();
         Map<UUID, String> kills = meta == null ? Map.of() : readWeaponKills(meta);
         Component name = meta != null && meta.hasDisplayName()
@@ -2488,7 +2667,72 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         meta.getPersistentDataContainer().set(weaponKillsKey, PersistentDataType.STRING, String.join("\n", entries));
     }
 
+    /**
+     * Re-renders the lore lines CivCosmetics owns (custom lore, crafted-by, slayer-of). Lines added by vanilla or
+     * other plugins are preserved: the exact lines this plugin rendered last time are recorded in {@code ownedLoreKey}
+     * and only those are replaced.
+     */
     private void rebuildWeaponLore(ItemMeta meta) {
+        List<Component> foreign = foreignLore(meta);
+        List<Component> owned = renderOwnedLore(meta);
+        if (!foreign.isEmpty() && !owned.isEmpty()) {
+            owned.add(0, Component.empty());
+        }
+        List<Component> lore = new ArrayList<>(foreign);
+        lore.addAll(owned);
+        if (owned.isEmpty() && !hasCosmeticLoreData(meta)) {
+            meta.getPersistentDataContainer().remove(ownedLoreKey);
+        } else {
+            // An empty list still marks the item as tracked, so it is never mistaken for a pre-tracking item.
+            List<String> keys = new ArrayList<>(owned.size());
+            for (Component line : owned) keys.add(loreKey(line));
+            meta.getPersistentDataContainer().set(ownedLoreKey, PersistentDataType.LIST.strings(), keys);
+        }
+        meta.lore(lore.isEmpty() ? null : lore);
+    }
+
+    private boolean hasCosmeticLoreData(ItemMeta meta) {
+        var pdc = meta.getPersistentDataContainer();
+        return pdc.has(customLoreLinesKey, PersistentDataType.STRING)
+            || pdc.has(weaponCrafterNameKey, PersistentDataType.STRING)
+            || pdc.has(weaponKillsKey, PersistentDataType.STRING);
+    }
+
+    private static String loreKey(Component line) {
+        return LORE_KEY_SERIALIZER.serialize(line);
+    }
+
+    /** Current lore minus the lines CivCosmetics rendered last time. */
+    private List<Component> foreignLore(ItemMeta meta) {
+        List<Component> current = meta.lore() == null ? new ArrayList<>() : new ArrayList<>(meta.lore());
+        if (current.isEmpty()) return current;
+        List<String> owned = meta.getPersistentDataContainer().get(ownedLoreKey, PersistentDataType.LIST.strings());
+        if (owned == null) {
+            // Items written before ownership tracking had lore rendered entirely by this plugin.
+            return hasCosmeticLoreData(meta) ? new ArrayList<>() : current;
+        }
+        if (owned.isEmpty()) return current;
+        List<String> keys = new ArrayList<>(current.size());
+        for (Component line : current) keys.add(loreKey(line));
+        // Prefer removing our lines as one contiguous block (the normal layout), searching from the end.
+        for (int start = keys.size() - owned.size(); start >= 0; start--) {
+            if (keys.subList(start, start + owned.size()).equals(owned)) {
+                current.subList(start, start + owned.size()).clear();
+                return current;
+            }
+        }
+        // Another plugin interleaved lines; remove each of ours once, from the end.
+        for (String key : owned) {
+            int index = keys.lastIndexOf(key);
+            if (index >= 0) {
+                keys.remove(index);
+                current.remove(index);
+            }
+        }
+        return current;
+    }
+
+    private List<Component> renderOwnedLore(ItemMeta meta) {
         List<Component> lore = new ArrayList<>();
         for (String line : customLoreLines(meta)) {
             lore.add(component(line));
@@ -2518,7 +2762,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 lore.add(formatWeaponLine(weaponLinkSlayerMoreFormat, "", hidden));
             }
         }
-        meta.lore(lore.isEmpty() ? null : lore);
+        return lore;
     }
 
     private Component formatWeaponLine(String format, String name, int count) {
@@ -2534,30 +2778,22 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         return Arrays.asList(raw.split("\n", -1));
     }
 
-    private void snapshotExistingLore(ItemMeta meta) {
-        if (meta.getPersistentDataContainer().has(customLoreLinesKey, PersistentDataType.STRING)) return;
-        List<Component> existing = meta.lore();
-        if (existing == null || existing.isEmpty()) return;
-        List<String> raw = new ArrayList<>();
-        for (Component line : existing) {
-            raw.add(LegacyComponentSerializer.legacySection().serialize(line));
-        }
-        meta.getPersistentDataContainer().set(customLoreLinesKey, PersistentDataType.STRING, String.join("\n", raw));
-    }
-
     private void playKillEffect(String id, Location loc, Player viewer, boolean preview) {
         switch (id) {
             case "pig" -> {
-                Pig pig = loc.getWorld().spawn(loc, Pig.class);
-                pig.customName(component("&d&lASCENDING"));
-                pig.setGravity(false);
-                pig.setAI(false);
+                Consumer<Pig> setup = spawned -> {
+                    prepareEffectEntity(spawned);
+                    spawned.customName(component("&d&lASCENDING"));
+                };
+                Pig pig = loc.getWorld().spawn(loc, Pig.class, setup);
+                effectEntities.add(pig);
                 killSound(loc, Sound.ENTITY_PIG_DEATH, 2f, 1.2f, preview);
                 new BukkitRunnable() {
                     int ticks;
                     @Override public void run() {
-                        if (ticks++ >= 25 || pig.isDead()) {
-                            firework(loc, Color.FUCHSIA, preview);
+                        if (ticks++ >= EFFECT_ENTITY_LIFETIME_TICKS || !pig.isValid()) {
+                            if (pig.isValid()) firework(loc, Color.FUCHSIA, preview);
+                            effectEntities.remove(pig);
                             pig.remove();
                             cancel();
                             return;
@@ -2631,15 +2867,16 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 particles(loc, Particle.HAPPY_VILLAGER, 150, 1.2, 1.8, 1.2, 0);
             }
             case "squid" -> {
-                Squid squid = loc.getWorld().spawn(loc, Squid.class);
-                squid.setGravity(false);
-                squid.setAI(false);
+                Consumer<Squid> setup = this::prepareEffectEntity;
+                Squid squid = loc.getWorld().spawn(loc, Squid.class, setup);
+                effectEntities.add(squid);
                 killSound(loc, Sound.ENTITY_SQUID_SQUIRT, 2f, .8f, preview);
                 new BukkitRunnable() {
                     int ticks;
                     @Override public void run() {
-                        if (ticks++ >= 25 || squid.isDead()) {
-                            firework(loc, Color.BLUE, preview);
+                        if (ticks++ >= EFFECT_ENTITY_LIFETIME_TICKS || !squid.isValid()) {
+                            if (squid.isValid()) firework(loc, Color.BLUE, preview);
+                            effectEntities.remove(squid);
                             squid.remove();
                             cancel();
                             return;
@@ -2743,6 +2980,81 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                 dust(loc, Color.fromRGB(120, 0, 0), 1.4f, 90, .8, 1.1, .8);
             }
         }
+    }
+
+    /** Configures a kill-effect mob before it is added to the world so it can never be farmed or left behind. */
+    private void prepareEffectEntity(LivingEntity entity) {
+        entity.getPersistentDataContainer().set(effectEntityKey, PersistentDataType.BYTE, (byte) 1);
+        entity.setPersistent(false);
+        entity.setInvulnerable(true);
+        entity.setSilent(true);
+        entity.setGravity(false);
+        entity.setAI(false);
+        entity.setCollidable(false);
+        entity.setCanPickupItems(false);
+        entity.setRemoveWhenFarAway(true);
+        if (entity instanceof Lootable lootable) {
+            lootable.setLootTable(null);
+        }
+    }
+
+    private boolean isEffectEntity(Entity entity) {
+        return entity.getPersistentDataContainer().has(effectEntityKey, PersistentDataType.BYTE);
+    }
+
+    private void removeEffectEntities() {
+        for (Entity entity : new ArrayList<>(effectEntities)) {
+            entity.remove();
+        }
+        effectEntities.clear();
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onEffectEntityDamage(EntityDamageEvent event) {
+        if (isEffectEntity(event.getEntity())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onEffectEntityDeath(EntityDeathEvent event) {
+        if (!isEffectEntity(event.getEntity())) return;
+        event.getDrops().clear();
+        event.setDroppedExp(0);
+    }
+
+    @EventHandler
+    public void onEffectEntitiesUnload(EntitiesUnloadEvent event) {
+        for (Entity entity : event.getEntities()) {
+            if ((entity instanceof Pig || entity instanceof Squid) && isEffectEntity(entity)) {
+                effectEntities.remove(entity);
+                entity.remove();
+            }
+        }
+    }
+
+    @EventHandler
+    public void onEffectEntitiesLoad(EntitiesLoadEvent event) {
+        // Safety net for mobs left over from older versions or a crash mid-effect.
+        for (Entity entity : event.getEntities()) {
+            if ((entity instanceof Pig || entity instanceof Squid) && isEffectEntity(entity)) {
+                entity.remove();
+            }
+        }
+    }
+
+    /** Per-player cooldown shared by kill-effect and trail previews. Returns false (and tells the player) if cooling down. */
+    private boolean tryPreview(Player player) {
+        if (effectPreviewCooldownMillis <= 0) return true;
+        long now = System.currentTimeMillis();
+        Long last = lastEffectPreview.get(player.getUniqueId());
+        if (last != null && now - last < effectPreviewCooldownMillis) {
+            long remaining = Math.max(1, (effectPreviewCooldownMillis - (now - last) + 999) / 1000);
+            msg(player, "&cPlease wait " + remaining + "s before previewing again.");
+            return false;
+        }
+        lastEffectPreview.put(player.getUniqueId(), now);
+        return true;
     }
 
     private void previewTrail(Player player, String trail) {
@@ -2882,24 +3194,80 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
     private void queueSave(PlayerData data, boolean includeGrants) {
         if (!storageHealthy || storage == null) return;
+        if (players.get(data.uuid) != data) {
+            // data(player) hands out a blank placeholder while a load is pending or failed; saving it would
+            // overwrite the player's real row with defaults.
+            return;
+        }
         PlayerData snapshot = data.copy();
         if (shuttingDown || storageExecutor == null || storageExecutor.isShutdown()) {
-            try {
-                if (includeGrants) storage.save(snapshot);
-                else storage.saveState(snapshot);
-            } catch (RuntimeException e) {
-                failStorage("save cosmetics", snapshot.uuid, e);
-            }
+            writeSnapshot(snapshot, includeGrants, false);
             return;
+        }
+        storageExecutor.execute(() -> writeSnapshot(snapshot, includeGrants, true));
+    }
+
+    /**
+     * Writes one snapshot (storage thread, or the main thread during shutdown). On failure the snapshot is kept in
+     * {@link #failedSaves} and retried periodically, so a transient DB error does not lose credits or grants.
+     */
+    private void writeSnapshot(PlayerData snapshot, boolean includeGrants, boolean retry) {
+        PendingSave pending = failedSaves.get(snapshot.uuid);
+        boolean grants = includeGrants || (pending != null && pending.includeGrants());
+        Supplier<Void> write = () -> {
+            if (grants) storage.save(snapshot);
+            else storage.saveState(snapshot);
+            return null;
+        };
+        try {
+            if (retry) withRetry(write);
+            else write.get();
+            if (pending != null) failedSaves.remove(snapshot.uuid, pending);
+        } catch (RuntimeException e) {
+            failedSaves.put(snapshot.uuid, new PendingSave(snapshot, grants));
+            logStorageFailure("save cosmetics", snapshot.uuid, e);
+        }
+    }
+
+    /** Main thread, periodic: re-attempts saves that failed, using the freshest in-memory data. */
+    private void retryFailedSaves() {
+        if (failedSaves.isEmpty() || shuttingDown || storageExecutor == null || storageExecutor.isShutdown()) return;
+        if (!failedSaveRetryInFlight.compareAndSet(false, true)) return;
+        List<PlayerData> snapshots = new ArrayList<>();
+        for (PendingSave pending : failedSaves.values()) {
+            PlayerData live = players.get(pending.snapshot().uuid);
+            snapshots.add(live != null ? live.copy() : pending.snapshot());
         }
         storageExecutor.execute(() -> {
             try {
-                if (includeGrants) storage.save(snapshot);
-                else storage.saveState(snapshot);
-            } catch (RuntimeException e) {
-                failStorage("save cosmetics", snapshot.uuid, e);
+                for (PlayerData snapshot : snapshots) {
+                    writeSnapshot(snapshot, false, false);
+                }
+                if (failedSaves.isEmpty()) getLogger().info("CivCosmetics storage recovered; queued saves written.");
+            } finally {
+                failedSaveRetryInFlight.set(false);
             }
         });
+    }
+
+    /** Runs a storage operation, retrying transient failures with a short backoff (not while shutting down). */
+    private <T> T withRetry(Supplier<T> operation) {
+        RuntimeException last = null;
+        for (int attempt = 0; attempt <= STORAGE_RETRY_DELAYS_MS.length; attempt++) {
+            try {
+                return operation.get();
+            } catch (RuntimeException e) {
+                last = e;
+                if (attempt == STORAGE_RETRY_DELAYS_MS.length || shuttingDown) break;
+                try {
+                    Thread.sleep(STORAGE_RETRY_DELAYS_MS[attempt]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        throw last;
     }
 
     private boolean isLoaded(Player player) {
@@ -2938,6 +3306,10 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private void loadAsync(UUID uuid, @Nullable Consumer<PlayerData> callback) {
+        if (!Bukkit.isPrimaryThread()) {
+            if (isEnabled()) Bukkit.getScheduler().runTask(this, () -> loadAsync(uuid, callback));
+            return;
+        }
         PlayerData existing = players.get(uuid);
         if (existing != null) {
             if (callback != null) callback.accept(existing);
@@ -2952,7 +3324,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         if (!loadingPlayers.add(uuid)) return;
         storageExecutor.execute(() -> {
             try {
-                PlayerData loaded = storage.load(uuid);
+                PlayerData loaded = withRetry(() -> storage.load(uuid));
                 Bukkit.getScheduler().runTask(this, () -> {
                     loadingPlayers.remove(uuid);
                     players.put(uuid, loaded);
@@ -2962,26 +3334,31 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                     }
                 });
             } catch (RuntimeException e) {
+                logStorageFailure("load cosmetics", uuid, e);
+                if (shuttingDown) return;
                 Bukkit.getScheduler().runTask(this, () -> {
                     loadingPlayers.remove(uuid);
                     loadCallbacks.remove(uuid);
                 });
-                failStorage("load cosmetics", uuid, e);
+                // Keep trying for online players instead of disabling the plugin; they run with defaults meanwhile.
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    Player online = Bukkit.getPlayer(uuid);
+                    if (online != null && !players.containsKey(uuid)) loadPlayer(online);
+                }, LOAD_RETRY_TICKS);
             }
         });
     }
 
-    private void failStorage(String action, @Nullable UUID uuid, RuntimeException e) {
-        if (!storageHealthy) return;
-        storageHealthy = false;
-        getLogger().warning("Failed to " + action + (uuid == null ? "" : " for " + uuid) + ": " + e.getMessage());
-        if (!shuttingDown) {
-            Bukkit.getScheduler().runTask(this, () -> getServer().getPluginManager().disablePlugin(this));
-        }
+    private void logStorageFailure(String action, @Nullable UUID uuid, RuntimeException e) {
+        getLogger().warning("Failed to " + action + (uuid == null ? "" : " for " + uuid) + ": " + e.getMessage()
+            + " (will retry; plugin stays enabled)");
     }
 
     private Inventory gui(Menu menu, int size, String title, @Nullable Object data) {
-        return Bukkit.createInventory(new GuiHolder(menu, data == null ? "" : data.toString()), size, color(title));
+        GuiHolder holder = new GuiHolder(menu, data == null ? "" : data.toString());
+        Inventory inventory = Bukkit.createInventory(holder, size, color(title));
+        holder.inventory = inventory;
+        return inventory;
     }
 
     private List<Integer> centeredRowSlots(int itemCount, List<Integer> rowSlots) {
@@ -3304,7 +3681,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private String cleanPrefix(String raw) {
-        return raw.replace("\"", "").replace("&k", "").replace("&K", "");
+        return LoreGuard.stripObfuscated(raw.replace("\"", ""));
     }
 
     private int visibleLength(String raw) {
@@ -3391,8 +3768,14 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         return ids;
     }
 
+    /** Thread-safe, side-effect-free lookup for placeholder callbacks; never starts a load. */
+    private PlayerData cachedData(Player player) {
+        PlayerData data = players.get(player.getUniqueId());
+        return data != null ? data : new PlayerData(player.getUniqueId());
+    }
+
     public String placeholderPrefix(Player player) {
-        PlayerData data = data(player);
+        PlayerData data = cachedData(player);
         if (data.selectedTag != null) {
             NamedCosmetic tag = find(tags, data.selectedTag);
             if (tag != null) return color(premadeTagDisplay(tag));
@@ -3412,6 +3795,9 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private record WeaponCrafter(@Nullable UUID uuid, String name) {
+    }
+
+    private record PendingSave(PlayerData snapshot, boolean includeGrants) {
     }
 
     private static class GrantPreset {
@@ -3445,12 +3831,25 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
     private enum Menu {
         HUB, KILL_EFFECTS, TRAILS, TAGS, PREFIX_PREVIEW, LORE_MENU, LORE_PREVIEW, LORE_CLEAR_CONFIRM, KILL_MESSAGES, KILLMSG_PREVIEW, LORE_HISTORY,
-        TRIM_PATTERNS, TRIM_MATERIALS, TRIM_CONFIRM, ADMIN_PLAYERS, ADMIN_CATEGORIES, ADMIN_CATEGORY, ADMIN_PRESETS
+        TRIM_PATTERNS, TRIM_MATERIALS, TRIM_CONFIRM,
+        ADMIN_PLAYERS(true), ADMIN_CATEGORIES(true), ADMIN_CATEGORY(true), ADMIN_PRESETS(true);
+
+        /** Admin menus re-check civ.cosmetic.admin on every click, not just when they are opened. */
+        private final boolean admin;
+
+        Menu() {
+            this(false);
+        }
+
+        Menu(boolean admin) {
+            this.admin = admin;
+        }
     }
 
     private static class GuiHolder implements InventoryHolder {
         private final Menu menu;
         private final String data;
+        private Inventory inventory;
 
         private GuiHolder(Menu menu, String data) {
             this.menu = menu;
@@ -3467,7 +3866,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
         @Override
         public @NotNull Inventory getInventory() {
-            throw new UnsupportedOperationException();
+            return inventory;
         }
     }
 
@@ -3579,8 +3978,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             return switch (params.toLowerCase(Locale.ROOT)) {
                 case "prefix" -> plugin.placeholderPrefix(player);
                 case "name" -> plugin.placeholderName(player);
-                case "selected_tag" -> plugin.data(player).selectedTag == null ? "" : plugin.data(player).selectedTag;
-                case "lore_credits" -> Integer.toString(plugin.data(player).loreCredits);
+                case "selected_tag" -> {
+                    String tag = plugin.cachedData(player).selectedTag;
+                    yield tag == null ? "" : tag;
+                }
+                case "lore_credits" -> Integer.toString(plugin.cachedData(player).loreCredits);
                 default -> null;
             };
         }
@@ -3597,7 +3999,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
         @Override
         public @NotNull String getVersion() {
-            return plugin.getDescription().getVersion();
+            return plugin.getPluginMeta().getVersion();
         }
 
         @Override
