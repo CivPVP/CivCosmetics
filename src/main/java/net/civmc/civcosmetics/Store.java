@@ -66,7 +66,9 @@ final class Store {
         /** The grant was recorded and applied. */
         APPLIED,
         /** This transaction and package were already recorded; nothing changed. */
-        DUPLICATE
+        DUPLICATE,
+        /** The transaction was refunded before this delivery arrived; recorded as refunded, nothing granted. */
+        ALREADY_REFUNDED
     }
 
     enum RedeemOutcome { REDEEMED, NO_TOKEN, ALREADY_OWNED }

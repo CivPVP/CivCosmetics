@@ -54,6 +54,12 @@ interface CosmeticsStorage extends AutoCloseable {
 
     List<Store.LedgerEntry> ledger(UUID uuid, int limit);
 
+    /** Storage thread only: the grant set the cached copy now holds, used as the baseline for the next grant diff. */
+    void setGrantBaseline(UUID uuid, Map<CivCosmeticsPlugin.Category, java.util.Set<String>> grants);
+
+    /** Storage thread only: drops per-player caches after the player left this server. */
+    void forget(UUID uuid);
+
     @Override
     void close();
 }

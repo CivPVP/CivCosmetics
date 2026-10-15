@@ -146,6 +146,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private final Map<UUID, PendingSave> failedSaves = new ConcurrentHashMap<>();
     private final AtomicBoolean failedSaveRetryInFlight = new AtomicBoolean();
     private final AtomicBoolean entitlementPollInFlight = new AtomicBoolean();
+    private final AtomicBoolean storeRetryInFlight = new AtomicBoolean();
     /** Store deliveries that could not reach the database. Kept on disk and retried; the ledger makes retries safe. */
     private final List<StoreOp> pendingStoreOps = new ArrayList<>();
     private File pendingStoreOpsFile;
@@ -172,7 +173,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     private CosmeticsStorage storage;
     private ExecutorService storageExecutor;
     private volatile boolean storageHealthy;
-    private boolean shuttingDown;
+    private volatile boolean shuttingDown;
     private String prefix;
     private String storeUrl;
     private String loreEditorUrl;
@@ -521,6 +522,12 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         trails.add(new NamedCosmetic("gold", "&6&lGOLD", Material.GOLD_NUGGET, Rarity.RARE));
         trails.add(new NamedCosmetic("frost", "&b&lFROST", Material.SNOWBALL, Rarity.RARE));
         trails.add(new NamedCosmetic("totem", "&a&lTOTEM", Material.TOTEM_OF_UNDYING, Rarity.LEGENDARY));
+
+        // Founder-exclusive set (civ.cosmetic.founder), sold before launch only.
+        tags.add(new NamedCosmetic("founder", "&#FFB000&l✪ ꜰᴏᴜɴᴅᴇʀ &f", Material.NETHER_STAR, Rarity.LEGENDARY, true));
+        killEffects.add(new NamedCosmetic("founder", "&6&lFOUNDER'S CROWN", Material.NETHER_STAR, Rarity.LEGENDARY, true));
+        trails.add(new NamedCosmetic("founder", "&6&lFOUNDER", Material.NETHER_STAR, Rarity.LEGENDARY, true));
+        applyRarityOverrides();
 
         killMessagePresets.add(new KillMessagePreset("classic", "&e&lClassic", Material.PAPER, "&8{victim} &7was killed by &8{killer} &7{item}"));
         killMessagePresets.add(new KillMessagePreset("deleted", "&c&lDeleted", Material.TNT, "&c{victim} &7was deleted by &6{killer} &7{item}"));
@@ -884,6 +891,17 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private void submitStoreOp(CommandSender sender, StoreOp op) {
+        boolean backlog;
+        synchronized (pendingStoreOps) {
+            backlog = !pendingStoreOps.isEmpty();
+        }
+        if (backlog) {
+            // Keep Tebex's order: a refund must never run ahead of the delivery it refunds.
+            queueStoreOp(op, "earlier store operations are still queued");
+            msg(sender, "&e" + op.describe() + " was queued behind earlier store operations.");
+            retryPendingStoreOps();
+            return;
+        }
         if (!storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) {
             queueStoreOp(op, "storage unavailable");
             msg(sender, "&eStorage unavailable; " + op.describe() + " was queued and will be retried.");
@@ -893,14 +911,13 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             try {
                 String result = withRetry(() -> applyStoreOp(op));
                 getLogger().info("[Store] " + op.describe() + ": " + result);
-                if (isEnabled()) Bukkit.getScheduler().runTask(this, () -> {
+                runOnMain(() -> {
                     msg(sender, "&a" + op.describe() + ": &f" + result);
                     afterStoreOp(op);
                 });
             } catch (RuntimeException e) {
                 queueStoreOp(op, e.getMessage());
-                if (isEnabled()) Bukkit.getScheduler().runTask(this, () ->
-                    msg(sender, "&e" + op.describe() + " could not be written yet; it was queued and will be retried."));
+                runOnMain(() -> msg(sender, "&e" + op.describe() + " could not be written yet; it was queued and will be retried."));
             }
         });
     }
@@ -926,7 +943,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
     }
 
     private static String outcome(Store.Outcome outcome, String what) {
-        return outcome == Store.Outcome.APPLIED ? "granted " + what : "already delivered; ignored";
+        return switch (outcome) {
+            case APPLIED -> "granted " + what;
+            case DUPLICATE -> "already delivered; ignored";
+            case ALREADY_REFUNDED -> "this transaction was already refunded; recorded, nothing granted";
+        };
     }
 
     /** Main thread: show the change to an online player now instead of waiting for the next poll. */
@@ -936,6 +957,16 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             return;
         }
         refreshEntitlements(op.uuid(), null);
+    }
+
+    /** Schedules work on the main thread unless the plugin is disabling; never throws. */
+    private void runOnMain(Runnable task) {
+        if (!isEnabled()) return;
+        try {
+            Bukkit.getScheduler().runTask(this, task);
+        } catch (IllegalStateException ignored) {
+            // Disabled between the check and the call.
+        }
     }
 
     private void queueStoreOp(StoreOp op, @Nullable String reason) {
@@ -979,7 +1010,7 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         }
     }
 
-    /** Main thread, periodic. */
+    /** Main thread, periodic. Applies queued operations in order and stops at the first failure to keep that order. */
     private void retryPendingStoreOps() {
         List<StoreOp> queued;
         synchronized (pendingStoreOps) {
@@ -987,20 +1018,26 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             queued = new ArrayList<>(pendingStoreOps);
         }
         if (!storageHealthy || storage == null || storageExecutor == null || storageExecutor.isShutdown()) return;
+        if (!storeRetryInFlight.compareAndSet(false, true)) return;
         storageExecutor.execute(() -> {
-            for (StoreOp op : queued) {
-                try {
-                    String result = applyStoreOp(op);
+            try {
+                for (StoreOp op : queued) {
+                    String result;
+                    try {
+                        result = applyStoreOp(op);
+                    } catch (RuntimeException e) {
+                        logStorageFailure("retry " + op.describe(), op.uuid(), e);
+                        return;
+                    }
                     getLogger().info("[Store] Retried " + op.describe() + ": " + result);
                     synchronized (pendingStoreOps) {
                         pendingStoreOps.remove(op);
                         writePendingStoreOps();
                     }
-                    if (isEnabled()) Bukkit.getScheduler().runTask(this, () -> afterStoreOp(op));
-                } catch (RuntimeException e) {
-                    logStorageFailure("retry " + op.describe(), op.uuid(), e);
-                    return;
+                    runOnMain(() -> afterStoreOp(op));
                 }
+            } finally {
+                storeRetryInFlight.set(false);
             }
         });
     }
@@ -1382,22 +1419,48 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
             msg(player, validation);
             return false;
         }
+        if (player.isOp()) {
+            finishLore(player, item, raw);
+            return true;
+        }
+        // Spend the credit in the database first; the item only changes once that succeeded.
+        UUID uuid = player.getUniqueId();
+        ItemStack expected = item.clone();
+        runStorage("spend a lore credit", uuid, () -> storage.spendLoreCredit(uuid), spent -> {
+            Player online = Bukkit.getPlayer(uuid);
+            PlayerData live = players.get(uuid);
+            if (!spent) {
+                if (live != null) live.loreCredits = 0;
+                if (online != null) msg(online, "&cYou do not have any Lore Credits. Get one at &e" + storeUrl + "&c.");
+                return;
+            }
+            if (live != null) live.loreCredits = Math.max(0, live.loreCredits - 1);
+            ItemStack held = online == null ? null : online.getInventory().getItemInMainHand();
+            if (online == null || held == null || !held.isSimilar(expected) || held.getAmount() != expected.getAmount()) {
+                // The item changed while the credit was being spent: give the credit back rather than lose it.
+                submitStoreOp(Bukkit.getConsoleSender(), new StoreOp(Store.KIND_LORE, uuid, null, 1,
+                    "refund-" + UUID.randomUUID().toString().replace("-", "").substring(0, 19), "lore_return"));
+                if (online != null) msg(online, "&eYour held item changed, so nothing was applied and the credit was returned.");
+                return;
+            }
+            finishLore(online, held, raw);
+        }, () -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) msg(online, "&cCouldn't use a Lore Credit right now; nothing was changed. Try again in a moment.");
+        });
+        return true;
+    }
+
+    private void finishLore(Player player, ItemStack item, String raw) {
+        PlayerData data = data(player);
         applyLoreToItem(item, raw);
         data.loreHistory.add(item.clone());
         while (data.loreHistory.size() > 27) {
             data.loreHistory.remove(0);
         }
-        if (!player.isOp()) {
-            data.loreCredits--;
-            UUID uuid = player.getUniqueId();
-            runStorage("spend a lore credit", uuid, () -> storage.spendLoreCredit(uuid), spent -> {
-                if (!spent) getLogger().warning("Lore credit for " + uuid + " was already spent on another server; lore was applied anyway.");
-            }, null);
-        }
         save(data);
-        msg(player, "&aItem updated. &eLore Credit consumed.");
+        msg(player, player.isOp() ? "&aItem updated." : "&aItem updated. &eLore Credit used.");
         player.playSound(player.getLocation(), Sound.BLOCK_ANVIL_USE, 1f, 1.2f);
-        return true;
     }
 
     private void applyLoreToItem(ItemStack item, String raw) {
@@ -2648,6 +2711,11 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         if (data != null) {
             save(data);
             players.remove(uuid, data);
+            if (storageExecutor != null && !storageExecutor.isShutdown()) {
+                storageExecutor.execute(() -> {
+                    if (!players.containsKey(uuid)) storage.forget(uuid);
+                });
+            }
         }
         lastEffectPreview.remove(uuid);
         linkCooldowns.clear(uuid);
@@ -3827,8 +3895,15 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
     private void applyEntitlements(UUID uuid, Store.Entitlements entitlements) {
         PlayerData data = players.get(uuid);
-        if (data == null) return;
+        if (data == null || entitlements.version() < data.entitlementsVersion) return;
         data.applyEntitlements(entitlements);
+        // Move the storage-side grant baseline only after the cached copy changed. The executor runs tasks in order, so
+        // saves copied before this point still diff against the old baseline and can't delete or revive grants.
+        Map<Category, Set<String>> baseline = new EnumMap<>(Category.class);
+        for (Category category : Category.values()) baseline.put(category, new HashSet<>(data.grants.get(category)));
+        if (storageExecutor != null && !storageExecutor.isShutdown()) {
+            storageExecutor.execute(() -> storage.setGrantBaseline(uuid, baseline));
+        }
         Player online = Bukkit.getPlayer(uuid);
         if (online != null) {
             validateSelections(online);
@@ -3857,15 +3932,14 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
         });
     }
 
-    /** Changes lore credits through an atomic database delta and mirrors it in the cached copy. */
+    /**
+     * Staff credit grants go through the purchase ledger under a generated id, so they are retried durably if the
+     * database is down and can never apply twice. The cached balance updates once the write lands.
+     */
     private void adjustLoreCredits(PlayerData data, int delta) {
-        if (delta == 0) return;
-        data.loreCredits = Math.max(0, data.loreCredits + delta);
-        UUID uuid = data.uuid;
-        runStorage("change lore credits", uuid, () -> storage.addLoreCredits(uuid, delta), balance -> {
-            PlayerData live = players.get(uuid);
-            if (live != null) live.loreCredits = balance;
-        }, null);
+        if (delta <= 0) return;
+        String id = "staff-" + UUID.randomUUID().toString().replace("-", "").substring(0, 20);
+        submitStoreOp(Bukkit.getConsoleSender(), new StoreOp(Store.KIND_LORE, data.uuid, null, delta, id, "staff"));
     }
 
     private boolean isLoaded(Player player) {

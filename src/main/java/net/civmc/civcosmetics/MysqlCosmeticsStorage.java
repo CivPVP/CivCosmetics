@@ -133,8 +133,8 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             statement.executeUpdate("""
                 CREATE TABLE IF NOT EXISTS civcosmetics_purchases (
                     id BIGINT NOT NULL AUTO_INCREMENT,
-                    transaction_id VARCHAR(64) NOT NULL,
-                    package_id VARCHAR(48) NOT NULL,
+                    transaction_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    package_id VARCHAR(48) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
                     uuid CHAR(36) NOT NULL,
                     kind VARCHAR(16) NOT NULL,
                     rarity VARCHAR(16) NULL,
@@ -153,8 +153,8 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                 CREATE TABLE IF NOT EXISTS civcosmetics_token_redemptions (
                     id BIGINT NOT NULL AUTO_INCREMENT,
                     uuid CHAR(36) NOT NULL,
-                    transaction_id VARCHAR(64) NOT NULL,
-                    package_id VARCHAR(48) NOT NULL,
+                    transaction_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    package_id VARCHAR(48) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
                     rarity VARCHAR(16) NOT NULL,
                     category VARCHAR(32) NOT NULL,
                     grant_id VARCHAR(128) NOT NULL,
@@ -165,11 +165,21 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                     INDEX idx_civcosmetics_redemptions_uuid (uuid)
                 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                 """);
+            statement.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS civcosmetics_refunded_transactions (
+                    transaction_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+                    refunded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (transaction_id)
+                ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                """);
         }
         // Schema 2: other servers bump this when they change a player's grants, credits or tokens.
         if (!columnExists(connection, "civcosmetics_player_state", "entitlements_version")) {
             try (Statement statement = connection.createStatement()) {
                 statement.executeUpdate("ALTER TABLE civcosmetics_player_state ADD COLUMN entitlements_version BIGINT NOT NULL DEFAULT 0");
+            } catch (SQLException e) {
+                // Another server starting at the same moment added it first (ER_DUP_FIELDNAME).
+                if (e.getErrorCode() != 1060) throw e;
             }
         }
         try (Statement statement = connection.createStatement()) {
@@ -500,7 +510,15 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
         try (Connection connection = getConnection()) {
             inTransaction(connection, () -> {
                 saveState(connection, data);
-                if (data.loreCredits > 0) addLoreCredits(connection, data.uuid, data.loreCredits);
+                if (data.loreCredits > 0) {
+                    // Set-to-at-least, so re-running a partly finished import never adds credits twice.
+                    try (PreparedStatement credits = connection.prepareStatement(
+                        "UPDATE civcosmetics_player_state SET lore_credits = GREATEST(lore_credits, ?) WHERE uuid = ?")) {
+                        credits.setInt(1, data.loreCredits);
+                        credits.setString(2, data.uuid.toString());
+                        credits.executeUpdate();
+                    }
+                }
                 saveGrantChanges(connection, data.uuid, null, normalizedGrantMap(data));
                 saveLoreHistory(connection, data);
                 return null;
@@ -528,7 +546,6 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             }
             loadGrants(connection, data);
             Map<CivCosmeticsPlugin.Category, Set<String>> grants = normalizedGrantMap(data);
-            grantSnapshots.put(uuid, normalizedGrantMap(data));
             return new Store.Entitlements(grants, credits, loadTokens(connection, uuid), version);
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to load entitlements for " + uuid, e);
@@ -653,10 +670,18 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                                          String packageId, SqlAction effect) {
         try (Connection connection = getConnection()) {
             return inTransaction(connection, () -> {
+                boolean refunded;
+                try (PreparedStatement tombstone = connection.prepareStatement(
+                    "SELECT 1 FROM civcosmetics_refunded_transactions WHERE transaction_id = ? LOCK IN SHARE MODE")) {
+                    tombstone.setString(1, transactionId);
+                    try (ResultSet result = tombstone.executeQuery()) {
+                        refunded = result.next();
+                    }
+                }
                 try (PreparedStatement insert = connection.prepareStatement("""
                     INSERT IGNORE INTO civcosmetics_purchases
-                        (transaction_id, package_id, uuid, kind, rarity, amount, spent, status)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, 'granted')
+                        (transaction_id, package_id, uuid, kind, rarity, amount, spent, status, note)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """)) {
                     insert.setString(1, transactionId);
                     insert.setString(2, packageId);
@@ -664,8 +689,11 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
                     insert.setString(4, kind);
                     insert.setString(5, rarity == null ? null : rarity.id);
                     insert.setInt(6, amount);
+                    insert.setString(7, refunded ? Store.STATUS_REFUNDED : Store.STATUS_GRANTED);
+                    insert.setString(8, refunded ? "arrived after its refund; nothing granted" : null);
                     if (insert.executeUpdate() == 0) return Store.Outcome.DUPLICATE;
                 }
+                if (refunded) return Store.Outcome.ALREADY_REFUNDED;
                 if (effect != null) effect.run(connection);
                 else bumpVersion(connection, uuid);
                 return Store.Outcome.APPLIED;
@@ -679,6 +707,12 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
     public Store.RefundResult refund(String transactionId) {
         try (Connection connection = getConnection()) {
             return inTransaction(connection, () -> {
+                // Remember the refund so a delivery for this transaction that arrives later grants nothing.
+                try (PreparedStatement tombstone = connection.prepareStatement(
+                    "INSERT IGNORE INTO civcosmetics_refunded_transactions (transaction_id) VALUES (?)")) {
+                    tombstone.setString(1, transactionId);
+                    tombstone.executeUpdate();
+                }
                 List<Store.LedgerEntry> rows = new ArrayList<>();
                 try (PreparedStatement select = connection.prepareStatement("""
                     SELECT transaction_id, package_id, uuid, kind, rarity, amount, spent, status, created_at, note
@@ -877,6 +911,22 @@ final class MysqlCosmeticsStorage implements CosmeticsStorage {
             result.getString("status"),
             created == null ? 0L : created.getTime(),
             result.getString("note"));
+    }
+
+    @Override
+    public void setGrantBaseline(UUID uuid, Map<CivCosmeticsPlugin.Category, Set<String>> grants) {
+        Map<CivCosmeticsPlugin.Category, Set<String>> copy = emptyGrantMap();
+        for (var entry : grants.entrySet()) {
+            for (String grant : entry.getValue()) copy.get(entry.getKey()).add(grant.toLowerCase(Locale.ROOT));
+        }
+        grantSnapshots.put(uuid, copy);
+    }
+
+    @Override
+    public void forget(UUID uuid) {
+        grantSnapshots.remove(uuid);
+        loreHistorySnapshots.remove(uuid);
+        unreadableLoreHistory.remove(uuid);
     }
 
     /** Tells other servers this player's grants, credits or tokens changed, so they reload them. */

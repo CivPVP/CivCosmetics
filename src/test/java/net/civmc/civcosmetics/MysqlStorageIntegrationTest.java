@@ -169,6 +169,33 @@ class MysqlStorageIntegrationTest {
     }
 
     @Test
+    void aDeliveryThatArrivesAfterItsRefundGrantsNothing() {
+        UUID player = UUID.randomUUID();
+        String tx = tx();
+        assertTrue(citadel.refund(tx).nothingToRefund());
+        assertEquals(Store.Outcome.ALREADY_REFUNDED, citadel.grantTokens(player, Rarity.LEGENDARY, 1, tx, "token_legendary"));
+        assertEquals(Store.Outcome.ALREADY_REFUNDED, citadel.grantLoreCredits(player, 3, tx, "lore_3"));
+        Store.Entitlements after = citadel.loadEntitlements(player);
+        assertEquals(0, after.tokens().get(Rarity.LEGENDARY));
+        assertEquals(0, after.loreCredits());
+        assertEquals("refunded", citadel.ledger(player, 5).get(0).status());
+    }
+
+    @Test
+    void transactionIdsAreCaseSensitive() {
+        UUID player = UUID.randomUUID();
+        String tx = tx();
+        assertEquals(Store.Outcome.APPLIED, citadel.grantLoreCredits(player, 1, tx, "lore_1"));
+        assertEquals(Store.Outcome.APPLIED, citadel.grantLoreCredits(player, 1, tx.toUpperCase(), "lore_1"));
+        assertEquals(2, citadel.loadEntitlements(player).loreCredits());
+    }
+
+    @Test
+    void initializingAgainOnAnUpgradedDatabaseIsHarmless() {
+        citadel.initialize();
+    }
+
+    @Test
     void changesBumpTheVersionOtherServersPoll() {
         UUID player = UUID.randomUUID();
         citadel.grantTokens(player, Rarity.COMMON, 1, tx(), "token_common");
