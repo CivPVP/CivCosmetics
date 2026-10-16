@@ -41,4 +41,23 @@ commands:
     permission: civ.cosmetic.admin
 permissions:
   civ.cosmetic.admin:
+    description: >-
+      Staff cosmetics management (/cosadmin grant|revoke|clear|preset|grantall|ledger, /cosadmingui, /titleadmin,
+      /addlorecredit without a transaction). Also unlocks every cosmetic. Store deliveries and refunds
+      (/cosadmin token|founder|refund, /addlorecredit with a transaction) are console-only and never granted by this.
     default: op
+  civ.cosmetic.founder:
+    description: Founder badge holders. Unlocks the Founder-exclusive cosmetics. Granted by the LuckPerms founder group.
+    default: false
+  civ.cosmetic.rarity.common:
+    description: Unlocks every Common cosmetic (Iron rank).
+    default: false
+  civ.cosmetic.rarity.rare:
+    description: Unlocks every Rare cosmetic (Diamond rank).
+    default: false
+  civ.cosmetic.rarity.epic:
+    description: Unlocks every Epic cosmetic (Netherite rank).
+    default: false
+  civ.cosmetic.rarity.legendary:
+    description: Unlocks every Legendary cosmetic (Netherite rank). Founder cosmetics are excluded.
+    default: false

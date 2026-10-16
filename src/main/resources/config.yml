@@ -1,5 +1,5 @@
 prefix: "&b&lCIV&f&lPVP"
-store-url: "https://www.patreon.com/c/CivPVP"
+store-url: "https://civpvp.net/store"
 lore-editor-url: "https://civpvp.net/lore-editor"
 prefix-max-length: 16
 trim-cooldown-hours: 12
@@ -19,10 +19,64 @@ mysql:
 lore:
   max-lines: 30
   max-total-characters: 4096
+  # Custom name/lore may only be applied to a single item, not a stack (stops mass-forging stackables).
+  allow-stacks: false
+  # Text that other plugins use to identify items. A custom name or lore line containing any entry is refused.
+  # Matching ignores case, colour codes, whitespace and invisible characters.
+  denied-text:
+    - "Compacted"                    # FactoryMod decompact_stack.compact_lore (decompaction dupe)
+    - "Crate"                        # FactoryMod compaction crate input
+    - "Factory Repair Kit"           # FactoryMod repair kit name
+    - "Repairs FactoryMod factories" # FactoryMod repair kit lore
+    - "Printing Plate"               # FactoryMod printing plate name
+    - "Bastion"                      # Bastion block names and lore
+    - "This bastion will protect"    # Bastion block lore
+    - "civstats-sword"               # CivStats sword-lore marker
+
+# Limits on text that players write themselves and that other players see (/settitle, /setkillmsg).
+# Matching uses the same rules as lore.denied-text. /titleadmin is not restricted.
+moderation:
+  kill-message-max-length: 100   # visible characters, colour codes not counted
+  denied-text:
+    - "Admin"
+    - "Staff"
+    - "Moderator"
+    - "Owner"
+    - "[Mod]"
+    - "[OP]"
+    - "[Dev]"
+    - "[Helper]"
+    - "[Server]"
+
+# How often each server checks whether another server changed an online player's grants, lore credits or
+# tokens (store delivery, refund, token redemption, staff grant). One indexed query per check for all players.
+entitlement-refresh-seconds: 15
+
+# Store wording shown on locked cosmetics. Ranks themselves are LuckPerms groups that grant
+# civ.cosmetic.rarity.<rarity>, civ.cosmetic.trim.all, civ.cosmetic.title.all and civ.cosmetic.killmsg.all.
+store:
+  rarity-ranks:
+    common: "&7Iron"
+    rare: "&bDiamond"
+    epic: "&dNetherite"
+    legendary: "&dNetherite"
+  perk-ranks:
+    title: "&bDiamond"
+    trim: "&bDiamond"
+    killmsg: "&dNetherite"
+
+# Optional rarity overrides for built-in cosmetics: <category>.<id>: common|rare|epic|legendary
+# Categories: killeffects, trails, tags. Founder cosmetics stay Founder-exclusive.
+cosmetic-rarities: {}
+
+# Minimum time between kill-effect / trail previews from the GUI, per player.
+preview-cooldown-ms: 3000
 
 weapon-link:
   enabled: true
   fallback-local-range: 1000
+  # Minimum time between /link uses, per player.
+  cooldown-seconds: 10
   crafted-by:
     enabled: true
     show-in-lore: true
