@@ -1367,9 +1367,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
                     msg(player, "&cStart a draft first with /setlore draft start <name>.");
                     return;
                 }
-                if (applyLore(player, draft.raw())) {
-                    loreDrafts.remove(uuid);
-                }
+                // The draft is dropped in finishLore once the item really changed, so a failed credit spend keeps it.
+                applyLore(player, draft.raw());
             }
             default -> msg(player, "&cUnknown draft action. Use /setlore draft for help.");
         }
@@ -1453,6 +1452,8 @@ public class CivCosmeticsPlugin extends JavaPlugin implements Listener, CommandE
 
     private void finishLore(Player player, ItemStack item, String raw) {
         PlayerData data = data(player);
+        LoreDraft draft = loreDrafts.get(player.getUniqueId());
+        if (draft != null && draft.raw().equals(raw)) loreDrafts.remove(player.getUniqueId());
         applyLoreToItem(item, raw);
         data.loreHistory.add(item.clone());
         while (data.loreHistory.size() > 27) {
